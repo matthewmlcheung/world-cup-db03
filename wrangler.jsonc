@@ -8,5 +8,10 @@
       "database_name": "world-cup-db",
       "database_id": "9d0fb067-223e-4049-a6c0-a96373719aa1"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": [
+      "0 */4 * * *"
+    ]
+  }
 }
