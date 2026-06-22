@@ -240,13 +240,12 @@ const worker = {
         let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a strategic asset review of this World Cup portfolio (up to 8 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or failures based on soccer logic. Avoid generic platitudes.';
         let maxTokensLimit = 400; 
 
-        // 🚀 THE FIX: Give it plenty of max tokens, but force brevity in the system prompt
         if (mode === "toxic") {
             systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE short, brutal English sentence. Be funny, ruthless, and drop all professionalism. Keep your response under 35 words so it does not get cut off.';
-            maxTokensLimit = 200; // Increased physical limit so it doesn't truncate mid-sentence
+            maxTokensLimit = 200;
         } else if (mode === "profile") {
             systemPrompt = 'You are an insightful behavioral psychologist. Based on this user\'s specific World Cup portfolio and rank, summarize their personality in exactly ONE short sentence. Guess their character or real-life traits based on how they invest (e.g. reckless, conservative, trend-chaser). Keep your response under 35 words so it does not get cut off.';
-            maxTokensLimit = 200; // Increased physical limit so it doesn't truncate mid-sentence
+            maxTokensLimit = 200;
         }
 
         const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
@@ -430,25 +429,6 @@ const worker = {
            if (["LAST_32", "LAST_16"].includes(stageStr)) stage = "knockout_early";
            if (["QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"].includes(stageStr)) stage = "knockout_late";
 
-           let editId = null;
-           const existingByApiId = existingMatches.find(m => m.api_match_id === apiId);
-           let existingManual = null;
-           
-           if (existingByApiId) {
-               if (existingByApiId.matchStatus === "FINISHED" && match.status === "FINISHED") continue;
-               editId = existingByApiId.db_id; 
-           } else {
-               existingManual = existingMatches.find(m => 
-                   !m.isBonusOnly && 
-                   ((m.teamA === teamA && m.teamB === teamB) || (m.teamA === teamB && m.teamB === teamA)) && 
-                   m.stage === stage
-               );
-               if (existingManual) {
-                   if (existingManual.matchStatus === "FINISHED" && match.status === "FINISHED") continue;
-                   editId = existingManual.db_id;
-               }
-           }
-           
            let fullGoalsA = match.score?.fullTime?.home ?? 0;
            let fullGoalsB = match.score?.fullTime?.away ?? 0;
            let regGoalsA = match.score?.regularTime?.home ?? fullGoalsA;
@@ -457,6 +437,34 @@ const worker = {
            if (stage === 'group' || stageStr === "GROUP_STAGE") {
                regGoalsA = fullGoalsA;
                regGoalsB = fullGoalsB;
+           }
+
+           let editId = null;
+           const existingByApiId = existingMatches.find(m => m.api_match_id === apiId);
+           let existingManual = null;
+           
+           if (existingByApiId) {
+               let scoreChanged = (existingByApiId.fullGoalsA !== fullGoalsA || existingByApiId.fullGoalsB !== fullGoalsB || existingByApiId.regGoalsA !== regGoalsA || existingByApiId.regGoalsB !== regGoalsB);
+               
+               if (existingByApiId.matchStatus === "FINISHED" && match.status === "FINISHED" && !scoreChanged) continue;
+               editId = existingByApiId.db_id; 
+           } else {
+               existingManual = existingMatches.find(m => 
+                   !m.isBonusOnly && 
+                   ((m.teamA === teamA && m.teamB === teamB) || (m.teamA === teamB && m.teamB === teamA)) && 
+                   m.stage === stage
+               );
+               if (existingManual) {
+                   let manualScoreChanged = false;
+                   if (existingManual.teamA === teamA) {
+                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsA || existingManual.fullGoalsB !== fullGoalsB);
+                   } else {
+                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsB || existingManual.fullGoalsB !== fullGoalsA);
+                   }
+                   
+                   if (existingManual.matchStatus === "FINISHED" && match.status === "FINISHED" && !manualScoreChanged) continue;
+                   editId = existingManual.db_id;
+               }
            }
 
            const matchDate = match.utcDate ? match.utcDate.split('T')[0] : null;
@@ -735,7 +743,6 @@ const worker = {
           </div>
         </div>
 
-        <!-- BRACKET SECTION -->
         <div class="card" style="grid-column: span 2;">
           <h2>Knockout Stage Bracket</h2>
           <div id="bracket-container" class="bracket-wrapper">
@@ -1504,6 +1511,7 @@ const worker = {
 
             detailsContent.innerHTML = html;
 
+            // Trigger the initial standard fetch
             fetch('/api/analysis/' + encodeURIComponent(name))
               .then(res => res.json())
               .then(data => {
