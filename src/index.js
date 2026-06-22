@@ -233,7 +233,6 @@ const worker = {
         const playerInfo = leaderboard.find(p => p.name === playerName);
         const rank = leaderboard.findIndex(p => p.name === playerName) + 1;
         
-        // 🚀 THE FIX: Separated out partial (0.5x) from standard (1x) backing
         const heavyInvestments = bets.filter(b => b.bet_amount == 3 || b.bet_amount == 2).map(b => b.team_name).join(', ') || 'None';
         const standardInvestments = bets.filter(b => b.bet_amount == 1).map(b => b.team_name).join(', ') || 'None';
         const partialInvestments = bets.filter(b => b.bet_amount == 0.5).map(b => b.team_name).join(', ') || 'None';
@@ -252,10 +251,14 @@ const worker = {
           ]
         });
 
-        const analysisText = aiResponse.response || (aiResponse.result && aiResponse.result.response);
+        // 🛡️ ANTI-SILENT FAILURE LOCK: Broadened extraction to support new OpenAI-compatible schemas
+        const analysisText = aiResponse.response || 
+                             (aiResponse.result && aiResponse.result.response) || 
+                             (aiResponse.choices && aiResponse.choices[0]?.message?.content) || 
+                             (aiResponse.result && aiResponse.result.choices && aiResponse.result.choices[0]?.message?.content);
         
         if (!analysisText || analysisText.trim() === "") {
-            throw new Error("AI returned an empty response. Model may be overloaded.");
+            throw new Error("AI returned an unexpected format: " + JSON.stringify(aiResponse));
         }
 
         return new Response(JSON.stringify({ analysis: analysisText }), { headers: { "Content-Type": "application/json" } });
