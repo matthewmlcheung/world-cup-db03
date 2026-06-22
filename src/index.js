@@ -220,6 +220,8 @@ const worker = {
 
     if (request.method === "GET" && url.pathname.startsWith("/api/analysis/")) {
       const playerName = decodeURIComponent(url.pathname.split("/")[3]);
+      const mode = url.searchParams.get("mode"); 
+      
       try {
         if (!env.AI) throw new Error("AI Binding is missing. Please check your wrangler.jsonc configuration.");
 
@@ -233,25 +235,28 @@ const worker = {
         const playerInfo = leaderboard.find(p => p.name === playerName);
         const rank = leaderboard.findIndex(p => p.name === playerName) + 1;
         
-        const heavyInvestments = bets.filter(b => b.bet_amount == 3 || b.bet_amount == 2).map(b => b.team_name).join(', ') || 'None';
-        const standardInvestments = bets.filter(b => b.bet_amount == 1).map(b => b.team_name).join(', ') || 'None';
-        const partialInvestments = bets.filter(b => b.bet_amount == 0.5).map(b => b.team_name).join(', ') || 'None';
-        const shortPositions = bets.filter(b => b.bet_amount == -1).map(b => b.team_name).join(', ') || 'None';
+        const explicitBetsString = bets.map(b => `${b.team_name} (${b.bet_amount}x)`).join(', ');
         
-        const aiResponse = await env.AI.run('@cf/zai-org/glm-4.7-flash', {
+        let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a thorough, strategic asset review of this World Cup portfolio (up to 10 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or causing their main failures based on real-world soccer logic. Avoid generic platitudes.';
+        let maxTokensLimit = 400; 
+
+        // 🚀 THE FIX: Dropped Cantonese translation, kept it to one savage English sentence, lowered token limit.
+        if (mode === "toxic") {
+            systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE brutal English sentence based on their explicit selections and numbers. Be funny, ruthless, and drop all professionalism. Do NOT provide translations.';
+            maxTokensLimit = 80; 
+        }
+
+        const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
+          max_tokens: maxTokensLimit,
           messages: [
-            { 
-              role: 'system', 
-              content: 'You are a ruthless, highly analytical Wall Street sports trader. Do NOT use cliché phrases like "mixed bag", "high-risk, high-reward", or "ticking time bomb". Provide exactly 3 punchy sentences analyzing the user\'s specific soccer portfolio.' 
-            },
+            { role: 'system', content: systemPrompt },
             { 
               role: 'user', 
-              content: `Analyze this World Cup portfolio for ${playerName} (Rank #${rank}, Score: ${playerInfo?.score || 0}). Heavily Backing (2x/3x leverage): ${heavyInvestments}. Standard Backing (1x): ${standardInvestments}. Partial Backing (0.5x): ${partialInvestments}. Actively Shorting (-1x penalty): ${shortPositions}. Call out the specific countries and evaluate the real-world soccer logic of this exact exposure.` 
+              content: `Player: ${playerName}. Rank: #${rank}. Score: ${playerInfo?.score || 0} pts. Selections & Leverage: ${explicitBetsString}.` 
             }
           ]
         });
 
-        // 🛡️ ANTI-SILENT FAILURE LOCK: Broadened extraction to support new OpenAI-compatible schemas
         const analysisText = aiResponse.response || 
                              (aiResponse.result && aiResponse.result.response) || 
                              (aiResponse.choices && aiResponse.choices[0]?.message?.content) || 
@@ -1182,6 +1187,28 @@ const worker = {
           });
         }
 
+        window.roastPlayer = function(name) {
+            const container = document.getElementById('ai-analysis-container');
+            container.innerHTML = '<span class="live-indicator" style="color: #ef4444; font-weight: bold;">🔥 Cooking the roast...</span>';
+            container.style.backgroundColor = '#fef2f2'; 
+            container.style.borderColor = '#ef4444';
+            container.style.color = '#991b1b';
+
+            fetch('/api/analysis/' + encodeURIComponent(name) + '?mode=toxic')
+              .then(res => res.json())
+              .then(data => {
+                 if (data.error) {
+                     container.innerHTML = '<span style="color:#ef4444;"><b>AI Error:</b> ' + data.error + '</span>';
+                 } else if (data.analysis) {
+                     container.innerHTML = '<strong>"</strong>' + data.analysis.split('\\n').join('<br>') + '<strong>"</strong>';
+                 } else {
+                     container.innerHTML = 'Analysis unavailable.';
+                 }
+              }).catch(err => {
+                 container.innerHTML = '<span style="color:#ef4444;"><b>Network Error:</b> AI Analysis failed to load.</span>';
+              });
+        };
+
         function showPlayerDetails(name) {
           const detailsContent = document.getElementById('details-content');
           document.getElementById('details-title').innerText = 'Dashboard: ' + name;
@@ -1214,8 +1241,14 @@ const worker = {
             html += '</tbody></table></div></details></div>';
 
             html += '<div class="player-dashboard-section" style="border-top:none; margin-top:0; padding-top:0;">' +
-                       '<h3>🤖 AI Portfolio Analysis</h3>' +
-                       '<div id="ai-analysis-container" style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 1rem; border-radius: 4px; color: #1e3a8a; font-size: 0.95rem; font-style: italic;">' +
+                       '<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">' +
+                           '<h3 style="margin: 0;">🤖 AI Portfolio Analysis</h3>' +
+                           '<div style="text-align: right;">' +
+                               '<button onclick="window.roastPlayer(\\'' + name.replace(/'/g, "\\\\'") + '\\')" style="background:#ef4444; color:white; border:none; padding:4px 10px; border-radius:4px; font-weight:bold; cursor:pointer; font-size: 0.8rem; box-shadow: 0 2px 4px rgba(239, 68, 68, 0.3);">🔥 Roast Me</button>' +
+                               '<div style="font-size: 0.65rem; color: #9ca3af; margin-top: 4px; font-style: italic;">⚠️ Warning: Use with care!</div>' +
+                           '</div>' +
+                       '</div>' +
+                       '<div id="ai-analysis-container" style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 1rem; border-radius: 4px; color: #1e3a8a; font-size: 0.95rem; font-style: italic; transition: all 0.3s ease;">' +
                          'Generating analysis... <span class="live-indicator">⏳</span>' +
                        '</div>' +
                      '</div>';
