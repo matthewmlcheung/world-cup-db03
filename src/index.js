@@ -237,16 +237,16 @@ const worker = {
         
         const explicitBetsString = bets.map(b => `${b.team_name} (${b.bet_amount}x)`).join(', ');
         
-        let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a thorough, strategic asset review of this World Cup portfolio (up to 10 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or causing their main failures based on real-world soccer logic. Avoid generic platitudes.';
+        let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a strategic asset review of this World Cup portfolio (up to 8 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or failures based on soccer logic. Avoid generic platitudes.';
         let maxTokensLimit = 400; 
 
-        // 🚀 THE FIX: Adding the new "profile" mode logic
+        // 🚀 THE FIX: Give it plenty of max tokens, but force brevity in the system prompt
         if (mode === "toxic") {
-            systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE brutal English sentence based on their explicit selections and numbers. Be funny, ruthless, and drop all professionalism. Do NOT provide translations.';
-            maxTokensLimit = 80; 
+            systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE short, brutal English sentence. Be funny, ruthless, and drop all professionalism. Keep your response under 35 words so it does not get cut off.';
+            maxTokensLimit = 200; // Increased physical limit so it doesn't truncate mid-sentence
         } else if (mode === "profile") {
-            systemPrompt = 'You are an insightful behavioral psychologist and sports analyst. Based on this user\'s specific World Cup portfolio and their current rank/score, summarize what they are like in exactly ONE sentence. Guess their character, real-life personality, or traits based on how they invest (e.g., risk-averse, contrarian, trend-chaser, reckless).';
-            maxTokensLimit = 80;
+            systemPrompt = 'You are an insightful behavioral psychologist. Based on this user\'s specific World Cup portfolio and rank, summarize their personality in exactly ONE short sentence. Guess their character or real-life traits based on how they invest (e.g. reckless, conservative, trend-chaser). Keep your response under 35 words so it does not get cut off.';
+            maxTokensLimit = 200; // Increased physical limit so it doesn't truncate mid-sentence
         }
 
         const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
@@ -1212,7 +1212,6 @@ const worker = {
               });
         };
 
-        // 🚀 NEW FUNCTION: Trigger the Behavioral Profile Mode
         window.profilePlayer = function(name) {
             const container = document.getElementById('ai-analysis-container');
             container.innerHTML = '<span class="live-indicator" style="color: #8b5cf6; font-weight: bold;">🔮 Reading personality...</span>';
@@ -1266,7 +1265,6 @@ const worker = {
             }
             html += '</tbody></table></div></details></div>';
 
-            // 🚀 THE FIX: Grouped buttons for the new mode and a shared warning label
             html += '<div class="player-dashboard-section" style="border-top:none; margin-top:0; padding-top:0;">' +
                        '<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">' +
                            '<h3 style="margin: 0;">🤖 AI Portfolio Analysis</h3>' +
@@ -1412,7 +1410,7 @@ const worker = {
                           let pureBondB = resB + (fgB * 8) + (fgA * -4);
                           let callB = fgB - fgA >= 3 ? 8 + ((fgB - fgA - 3) * 8) : 0;
 
-                          const isKo = payload.stage ? payload.stage.startsWith('knockout') : payload.isMf;
+                          const isKo = payload.stage ? payload.stage.startsWith('knockout') : payload.isKnockout;
                           const isMf = payload.stage === 'knockout_late';
                           const regA = teamRegions[payload.teamA];
                           const regB = teamRegions[payload.teamB];
