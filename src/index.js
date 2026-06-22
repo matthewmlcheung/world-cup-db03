@@ -221,38 +221,41 @@ const worker = {
     if (request.method === "GET" && url.pathname.startsWith("/api/analysis/")) {
       const playerName = decodeURIComponent(url.pathname.split("/")[3]);
       try {
-        if (!env.AI) {
-           throw new Error("AI Binding is missing. Please check your wrangler.jsonc configuration.");
-        }
+        if (!env.AI) throw new Error("AI Binding is missing. Please check your wrangler.jsonc configuration.");
 
         const { results: bets } = await env.DB.prepare("SELECT team_name, bet_amount FROM Bets WHERE player_name = ?").bind(playerName).all();
-        const { results: leaderboard } = await env.DB.prepare("SELECT name, score FROM Players ORDER BY score DESC").all();
         
+        if (bets.length === 0) {
+            return new Response(JSON.stringify({ analysis: "This player is currently sitting on the sidelines with zero active market exposure. No portfolio to analyze!" }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        const { results: leaderboard } = await env.DB.prepare("SELECT name, score FROM Players ORDER BY score DESC").all();
         const playerInfo = leaderboard.find(p => p.name === playerName);
         const rank = leaderboard.findIndex(p => p.name === playerName) + 1;
         
-        const unitOptionsLabels = { "-1": "Short Position", "3": "Bond+Fwd+Call", "2": "Bond+Fwd", "1": "Standard Bond", "0.5": "Half Bond" };
-        const portfolioContext = bets.map(b => `${b.team_name} (${unitOptionsLabels[b.bet_amount] || b.bet_amount})`).join(", ");
+        // 🚀 THE FIX: Separated out partial (0.5x) from standard (1x) backing
+        const heavyInvestments = bets.filter(b => b.bet_amount == 3 || b.bet_amount == 2).map(b => b.team_name).join(', ') || 'None';
+        const standardInvestments = bets.filter(b => b.bet_amount == 1).map(b => b.team_name).join(', ') || 'None';
+        const partialInvestments = bets.filter(b => b.bet_amount == 0.5).map(b => b.team_name).join(', ') || 'None';
+        const shortPositions = bets.filter(b => b.bet_amount == -1).map(b => b.team_name).join(', ') || 'None';
         
-        // 🤖 CALLING CLOUDFLARE WORKERS AI (Upgraded to Llama 3.2)
-        const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
+        const aiResponse = await env.AI.run('@cf/zai-org/glm-4.7-flash', {
           messages: [
             { 
               role: 'system', 
-              content: 'You are a witty, slightly sarcastic sports finance analyst evaluating a fantasy World Cup bracket. Provide a brief, punchy 3-sentence risk analysis of the user\'s betting portfolio. Mention specific teams they picked. No pleasantries like "Here is the analysis", just jump straight into the critique.' 
+              content: 'You are a ruthless, highly analytical Wall Street sports trader. Do NOT use cliché phrases like "mixed bag", "high-risk, high-reward", or "ticking time bomb". Provide exactly 3 punchy sentences analyzing the user\'s specific soccer portfolio.' 
             },
             { 
               role: 'user', 
-              content: `Player Name: ${playerName}. Current Rank: #${rank}. Total Points: ${playerInfo?.score || 0}. Portfolio Assets: ${portfolioContext || "No active bets."}` 
+              content: `Analyze this World Cup portfolio for ${playerName} (Rank #${rank}, Score: ${playerInfo?.score || 0}). Heavily Backing (2x/3x leverage): ${heavyInvestments}. Standard Backing (1x): ${standardInvestments}. Partial Backing (0.5x): ${partialInvestments}. Actively Shorting (-1x penalty): ${shortPositions}. Call out the specific countries and evaluate the real-world soccer logic of this exact exposure.` 
             }
           ]
         });
 
-        // 🛡️ ANTI-SILENT FAILURE LOCK
         const analysisText = aiResponse.response || (aiResponse.result && aiResponse.result.response);
         
-        if (!analysisText) {
-            throw new Error("AI returned unexpected format: " + JSON.stringify(aiResponse));
+        if (!analysisText || analysisText.trim() === "") {
+            throw new Error("AI returned an empty response. Model may be overloaded.");
         }
 
         return new Response(JSON.stringify({ analysis: analysisText }), { headers: { "Content-Type": "application/json" } });
