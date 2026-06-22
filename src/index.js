@@ -240,10 +240,13 @@ const worker = {
         let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a thorough, strategic asset review of this World Cup portfolio (up to 10 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or causing their main failures based on real-world soccer logic. Avoid generic platitudes.';
         let maxTokensLimit = 400; 
 
-        // 🚀 THE FIX: Dropped Cantonese translation, kept it to one savage English sentence, lowered token limit.
+        // 🚀 THE FIX: Adding the new "profile" mode logic
         if (mode === "toxic") {
             systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE brutal English sentence based on their explicit selections and numbers. Be funny, ruthless, and drop all professionalism. Do NOT provide translations.';
             maxTokensLimit = 80; 
+        } else if (mode === "profile") {
+            systemPrompt = 'You are an insightful behavioral psychologist and sports analyst. Based on this user\'s specific World Cup portfolio and their current rank/score, summarize what they are like in exactly ONE sentence. Guess their character, real-life personality, or traits based on how they invest (e.g., risk-averse, contrarian, trend-chaser, reckless).';
+            maxTokensLimit = 80;
         }
 
         const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
@@ -1209,6 +1212,29 @@ const worker = {
               });
         };
 
+        // 🚀 NEW FUNCTION: Trigger the Behavioral Profile Mode
+        window.profilePlayer = function(name) {
+            const container = document.getElementById('ai-analysis-container');
+            container.innerHTML = '<span class="live-indicator" style="color: #8b5cf6; font-weight: bold;">🔮 Reading personality...</span>';
+            container.style.backgroundColor = '#f5f3ff'; 
+            container.style.borderColor = '#8b5cf6';
+            container.style.color = '#5b21b6';
+
+            fetch('/api/analysis/' + encodeURIComponent(name) + '?mode=profile')
+              .then(res => res.json())
+              .then(data => {
+                 if (data.error) {
+                     container.innerHTML = '<span style="color:#ef4444;"><b>AI Error:</b> ' + data.error + '</span>';
+                 } else if (data.analysis) {
+                     container.innerHTML = '<strong>"</strong>' + data.analysis.split('\\n').join('<br>') + '<strong>"</strong>';
+                 } else {
+                     container.innerHTML = 'Analysis unavailable.';
+                 }
+              }).catch(err => {
+                 container.innerHTML = '<span style="color:#ef4444;"><b>Network Error:</b> AI Analysis failed to load.</span>';
+              });
+        };
+
         function showPlayerDetails(name) {
           const detailsContent = document.getElementById('details-content');
           document.getElementById('details-title').innerText = 'Dashboard: ' + name;
@@ -1240,12 +1266,16 @@ const worker = {
             }
             html += '</tbody></table></div></details></div>';
 
+            // 🚀 THE FIX: Grouped buttons for the new mode and a shared warning label
             html += '<div class="player-dashboard-section" style="border-top:none; margin-top:0; padding-top:0;">' +
                        '<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">' +
                            '<h3 style="margin: 0;">🤖 AI Portfolio Analysis</h3>' +
-                           '<div style="text-align: right;">' +
-                               '<button onclick="window.roastPlayer(\\'' + name.replace(/'/g, "\\\\'") + '\\')" style="background:#ef4444; color:white; border:none; padding:4px 10px; border-radius:4px; font-weight:bold; cursor:pointer; font-size: 0.8rem; box-shadow: 0 2px 4px rgba(239, 68, 68, 0.3);">🔥 Roast Me</button>' +
-                               '<div style="font-size: 0.65rem; color: #9ca3af; margin-top: 4px; font-style: italic;">⚠️ Warning: Use with care!</div>' +
+                           '<div style="text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 4px;">' +
+                               '<div style="display: flex; gap: 8px;">' +
+                                   '<button onclick="window.profilePlayer(\\'' + name.replace(/'/g, "\\\\'") + '\\')" style="background:#8b5cf6; color:white; border:none; padding:4px 10px; border-radius:4px; font-weight:bold; cursor:pointer; font-size: 0.8rem; box-shadow: 0 2px 4px rgba(139, 92, 246, 0.3);">🔮 Read Personality</button>' +
+                                   '<button onclick="window.roastPlayer(\\'' + name.replace(/'/g, "\\\\'") + '\\')" style="background:#ef4444; color:white; border:none; padding:4px 10px; border-radius:4px; font-weight:bold; cursor:pointer; font-size: 0.8rem; box-shadow: 0 2px 4px rgba(239, 68, 68, 0.3);">🔥 Roast Me</button>' +
+                               '</div>' +
+                               '<div style="font-size: 0.65rem; color: #9ca3af; font-style: italic;">⚠️ Warning: AI opinions. Use with care!</div>' +
                            '</div>' +
                        '</div>' +
                        '<div id="ai-analysis-container" style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 1rem; border-radius: 4px; color: #1e3a8a; font-size: 0.95rem; font-style: italic; transition: all 0.3s ease;">' +
@@ -1382,7 +1412,7 @@ const worker = {
                           let pureBondB = resB + (fgB * 8) + (fgA * -4);
                           let callB = fgB - fgA >= 3 ? 8 + ((fgB - fgA - 3) * 8) : 0;
 
-                          const isKo = payload.stage ? payload.stage.startsWith('knockout') : payload.isKnockout;
+                          const isKo = payload.stage ? payload.stage.startsWith('knockout') : payload.isMf;
                           const isMf = payload.stage === 'knockout_late';
                           const regA = teamRegions[payload.teamA];
                           const regB = teamRegions[payload.teamB];
