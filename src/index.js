@@ -22,6 +22,13 @@ const worker = {
       "Croatia": "UEFA (Europe)", "Ghana": "CAF (Africa)", "Panama": "CONCACAF (North America)"
     };
 
+    const apiNameMapper = { 
+        "USA": "United States", "Korea Republic": "South Korea", "Czechia": "Czech Republic", 
+        "Côte d'Ivoire": "Ivory Coast", "Congo DR": "DR Congo", "Cape Verde Islands": "Cape Verde",
+        "Cabo Verde": "Cape Verde", "Türkiye": "Turkey", "Curacao": "Curaçao",
+        "Bosnia-Herzegovina": "Bosnia and Herzegovina", "IR Iran": "Iran"
+    };
+
     const ensureTables = async () => {
       await env.DB.prepare("CREATE TABLE IF NOT EXISTS MatchHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, log_text TEXT, score_deltas TEXT, match_data TEXT, display_order INTEGER, match_date TEXT, api_match_id INTEGER UNIQUE, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)").run();
       try { await env.DB.prepare("ALTER TABLE MatchHistory ADD COLUMN match_date TEXT").run(); } catch (e) {}
@@ -30,7 +37,7 @@ const worker = {
 
     // --- CORE MATH ENGINE ---
     const processMatch = async (env, payload, teamRegions) => {
-      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
+      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute, goals } = payload;
       const isKnockout = stage ? stage.startsWith('knockout') : payload.isKnockout;
       const isMutualFundActive = stage === 'knockout_late';
       const statements = [];
@@ -70,7 +77,6 @@ const worker = {
       let pureBonusA = Number(bonusA || 0);
       let pureBonusB = Number(bonusB || 0);
 
-      // UNIFIED BASE BOND (Pure + Bonus)
       let baseBondA = pureBondA + pureBonusA;
       let baseBondB = pureBondB + pureBonusB;
 
@@ -362,13 +368,6 @@ const worker = {
         const allMatches = data.matches || [];
         let newMatchesCount = 0;
 
-        const apiNameMapper = { 
-            "USA": "United States", "Korea Republic": "South Korea", "Czechia": "Czech Republic", 
-            "Côte d'Ivoire": "Ivory Coast", "Congo DR": "DR Congo", "Cape Verde Islands": "Cape Verde",
-            "Cabo Verde": "Cape Verde", "Türkiye": "Turkey", "Curacao": "Curaçao",
-            "Bosnia-Herzegovina": "Bosnia and Herzegovina", "IR Iran": "Iran"
-        };
-
         const { results: existingRows } = await env.DB.prepare("SELECT id, api_match_id, match_data FROM MatchHistory").all();
         
         const existingMatches = existingRows.map(r => {
@@ -379,14 +378,6 @@ const worker = {
                return parsed;
            } catch(e){ return {}; }
         });
-
-        const getTodayString = () => {
-            const d = new Date();
-            const year = d.getFullYear();
-            const month = String(d.getMonth() + 1).padStart(2, '0');
-            const day = String(d.getDate()).padStart(2, '0');
-            return year + "-" + month + "-" + day;
-        };
 
         const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
         const advancedTeams = new Set();
@@ -445,7 +436,6 @@ const worker = {
            
            if (existingByApiId) {
                let scoreChanged = (existingByApiId.fullGoalsA !== fullGoalsA || existingByApiId.fullGoalsB !== fullGoalsB || existingByApiId.regGoalsA !== regGoalsA || existingByApiId.regGoalsB !== regGoalsB);
-               
                if (existingByApiId.matchStatus === "FINISHED" && match.status === "FINISHED" && !scoreChanged) continue;
                editId = existingByApiId.db_id; 
            } else {
@@ -461,7 +451,6 @@ const worker = {
                    } else {
                        manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsB || existingManual.fullGoalsB !== fullGoalsA);
                    }
-                   
                    if (existingManual.matchStatus === "FINISHED" && match.status === "FINISHED" && !manualScoreChanged) continue;
                    editId = existingManual.db_id;
                }
@@ -646,7 +635,7 @@ const worker = {
     </head>
     <body>
       <div class="container">
-        <h1>🏆 World Cup 2026 Dashboard</h1>
+        <h1>🏆 World Cup 2026 DB03 Dashboard</h1>
         
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1715,7 +1704,7 @@ const worker = {
     });
     const response = await worker.fetch(dummyRequest, env, ctx);
     const result = await response.json();
-    console.log(`Automated sync results: ${JSON.stringify(result)}`);
+    console.log('Automated sync results: ' + JSON.stringify(result));
   }
 };
 
