@@ -37,7 +37,7 @@ const worker = {
     };
 
     // --- CORE MATH ENGINE ---
-    const processMatch = async (env, payload, teamRegions) => {
+    const processMatch = async (env, payload, teamRegions, originalPayloadForDb = null) => {
       let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
       const isKnockout = stage ? stage.startsWith('knockout') : payload.isKnockout;
       const isMutualFundActive = stage === 'knockout_late';
@@ -194,7 +194,7 @@ const worker = {
           `;
       }
       
-      const matchDataJson = JSON.stringify(payload);
+      const matchDataJson = JSON.stringify(originalPayloadForDb || payload);
       const deltasJson = JSON.stringify(scoreDeltas);
       const finalMatchDate = matchDate || null; 
 
@@ -211,7 +211,6 @@ const worker = {
     };
 
     // --- API ENDPOINTS ---
-    
     if (request.method === "GET" && url.pathname === "/api/settings") {
       try {
         await ensureTables();
@@ -220,38 +219,89 @@ const worker = {
       } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
     }
 
-    if (request.method === "POST" && url.pathname === "/api/settings") {
-      try {
-        await ensureTables();
-        const { key, value } = await request.json();
-        await env.DB.prepare("INSERT OR REPLACE INTO Settings (key, value) VALUES (?, ?)").bind(key, value).run();
-        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-      } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
-    }
-
     if (request.method === "POST" && url.pathname === "/api/recalculate") {
       try {
-        await env.DB.prepare("UPDATE Players SET score = 0").run();
-        const { results: history } = await env.DB.prepare("SELECT score_deltas FROM MatchHistory").all();
+        await ensureTables();
+        const { logic } = await request.json();
         
-        const playerTotals = {};
-        history.forEach(row => {
-            if (row.score_deltas) {
-                const deltas = JSON.parse(row.score_deltas);
-                for (const [pName, change] of Object.entries(deltas)) {
-                    playerTotals[pName] = (playerTotals[pName] || 0) + change;
-                }
-            }
+        if (logic) {
+            await env.DB.prepare("INSERT OR REPLACE INTO Settings (key, value) VALUES ('bonus_logic', ?)").bind(logic).run();
+        }
+        
+        const settingRow = await env.DB.prepare("SELECT value FROM Settings WHERE key = 'bonus_logic'").first();
+        const bonusLogic = settingRow ? settingRow.value : 'immediate';
+
+        const { results: history } = await env.DB.prepare("SELECT id, match_data, match_date, api_match_id FROM MatchHistory ORDER BY display_order ASC, id ASC").all();
+
+        await env.DB.prepare("DELETE FROM MatchHistory").run();
+        await env.DB.prepare("UPDATE Players SET score = 0").run();
+
+        // 🚀 CRITICAL FIX: Build team stats globally for recalculation, ignoring API group labels
+        const teamStats = {};
+        const teamNames = Object.keys(teamRegions);
+        teamNames.forEach(team => {
+            teamStats[team] = { pts: 0, gd: 0, gf: 0, mp: 0 };
         });
 
-        const statements = [];
-        for (const [pName, total] of Object.entries(playerTotals)) {
-            statements.push(env.DB.prepare("UPDATE Players SET score = ? WHERE name = ?").bind(total, pName));
+        const advancedTeams = new Set();
+        let processedBonuses = new Set();
+
+        for (const row of history) {
+            let payload = JSON.parse(row.match_data);
+            if (payload.isBonusOnly) continue; 
+            
+            let isGroup = payload.stage === 'group' || payload.stage === 'GROUP_STAGE';
+            let originalBonusA = Number(payload.bonusA) || 0;
+            let originalBonusB = Number(payload.bonusB) || 0;
+
+            if (isGroup) {
+                let gA = parseInt(payload.regGoalsA ?? payload.goalsA) || 0;
+                let gB = parseInt(payload.regGoalsB ?? payload.goalsB) || 0;
+
+                if(teamStats[payload.teamA]) {
+                    teamStats[payload.teamA].mp++;
+                    teamStats[payload.teamA].gf += gA;
+                    teamStats[payload.teamA].gd += (gA - gB);
+                    if (gA > gB) teamStats[payload.teamA].pts += 3;
+                    else if (gA === gB) teamStats[payload.teamA].pts += 1;
+                }
+                if(teamStats[payload.teamB]) {
+                    teamStats[payload.teamB].mp++;
+                    teamStats[payload.teamB].gf += gB;
+                    teamStats[payload.teamB].gd += (gB - gA);
+                    if (gB > gA) teamStats[payload.teamB].pts += 3;
+                    else if (gA === gB) teamStats[payload.teamB].pts += 1;
+                }
+            }
+
+            let mathEnginePayload = { ...payload };
+
+            if (bonusLogic === 'separate' && isGroup) {
+                if (originalBonusA === 12) mathEnginePayload.bonusA = 0;
+                if (originalBonusB === 12) mathEnginePayload.bonusB = 0;
+            }
+
+            mathEnginePayload.editId = null; 
+            await processMatch(env, mathEnginePayload, teamRegions, payload);
+
+            if (bonusLogic === 'separate') {
+                const checkBonus = async (team, origBonus) => {
+                    if (origBonus === 12 && teamStats[team] && teamStats[team].mp >= 3 && !processedBonuses.has(team)) {
+                        let bonusPayload = {
+                            teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
+                            teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
+                            stage: 'group', matchDate: payload.matchDate, apiMatchId: null, isKnockout: false, isBonusOnly: true,
+                            matchStatus: "FINISHED", matchMinute: null, editId: null
+                        };
+                        await processMatch(env, bonusPayload, teamRegions, bonusPayload);
+                        processedBonuses.add(team);
+                    }
+                };
+                await checkBonus(payload.teamA, originalBonusA);
+                await checkBonus(payload.teamB, originalBonusB);
+            }
         }
         
-        if (statements.length > 0) {
-            await env.DB.batch(statements);
-        }
         return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500 });
@@ -436,17 +486,56 @@ const worker = {
            } catch(e){ return {}; }
         });
 
-        const getTodayString = () => {
-            const d = new Date();
-            const year = d.getFullYear();
-            const month = String(d.getMonth() + 1).padStart(2, '0');
-            const day = String(d.getDate()).padStart(2, '0');
-            return year + "-" + month + "-" + day;
-        };
+        // 🚀 CRITICAL FIX: Track group standings completely independently of the external API's group mappings!
+        const teamStats = {};
+        const teamNames = Object.keys(teamRegions);
+        teamNames.forEach(team => {
+            teamStats[team] = { pts: 0, gd: 0, gf: 0, mp: 0 };
+        });
 
-        const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
+        allMatches.forEach(m => {
+            let stageStr = m.stage || "GROUP_STAGE";
+            if ((stageStr === "GROUP_STAGE" || stageStr === "group") && m.status === "FINISHED") {
+                let tA = apiNameMapper[m.homeTeam?.name] || m.homeTeam?.name;
+                let tB = apiNameMapper[m.awayTeam?.name] || m.awayTeam?.name;
+                
+                let gA = m.score?.fullTime?.home ?? 0;
+                let gB = m.score?.fullTime?.away ?? 0;
+
+                if (teamStats[tA]) {
+                    teamStats[tA].mp++;
+                    teamStats[tA].gf += gA;
+                    teamStats[tA].gd += (gA - gB);
+                    if (gA > gB) teamStats[tA].pts += 3;
+                    else if (gA === gB) teamStats[tA].pts += 1;
+                }
+                
+                if (teamStats[tB]) {
+                    teamStats[tB].mp++;
+                    teamStats[tB].gf += gB;
+                    teamStats[tB].gd += (gB - gA);
+                    if (gB > gA) teamStats[tB].pts += 3;
+                    else if (gA === gB) teamStats[tB].pts += 1;
+                }
+            }
+        });
+
         const advancedTeams = new Set();
         
+        // Find top 2 using identical UI Grouping logic
+        for (let i = 0; i < teamNames.length; i += 4) {
+            const groupTeams = teamNames.slice(i, i + 4);
+            groupTeams.sort((a, b) => {
+                if (teamStats[b].pts !== teamStats[a].pts) return teamStats[b].pts - teamStats[a].pts;
+                if (teamStats[b].gd !== teamStats[a].gd) return teamStats[b].gd - teamStats[a].gd;
+                return teamStats[b].gf - teamStats[a].gf;
+            });
+            
+            if (teamStats[groupTeams[0]].mp === 3) advancedTeams.add(groupTeams[0]);
+            if (teamStats[groupTeams[1]].mp === 3) advancedTeams.add(groupTeams[1]);
+        }
+
+        const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
         allMatches.forEach(m => {
             if (knockoutStages.includes(m.stage)) {
                 if (m.homeTeam?.name) advancedTeams.add(apiNameMapper[m.homeTeam.name] || m.homeTeam.name);
@@ -472,13 +561,20 @@ const worker = {
                     clinchingMatches[lastMatch.id][team] = 12;
                 }
             } else {
-                if (groupMatches.length >= 3) {
+                if (teamStats[team].mp >= 3) {
                     standaloneBonusesToProcess.push(team);
                 }
             }
         });
 
-        // 🚀 NEW: Process separate standalone bonus records
+        const getTodayString = () => {
+            const d = new Date();
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return year + "-" + month + "-" + day;
+        };
+
         for (const team of standaloneBonusesToProcess) {
            const existingBonus = existingMatches.find(m => m.isBonusOnly && m.teamA === team);
            if (!existingBonus) {
@@ -519,51 +615,7 @@ const worker = {
                regGoalsB = fullGoalsB;
            }
 
-           let editId = null;
-           const existingByApiId = existingMatches.find(m => m.api_match_id === apiId);
-           let existingManual = null;
-           
-           if (existingByApiId) {
-               let scoreChanged = (existingByApiId.fullGoalsA !== fullGoalsA || existingByApiId.fullGoalsB !== fullGoalsB || existingByApiId.regGoalsA !== regGoalsA || existingByApiId.regGoalsB !== regGoalsB);
-               if (existingByApiId.matchStatus === "FINISHED" && match.status === "FINISHED" && !scoreChanged) continue;
-               editId = existingByApiId.db_id; 
-           } else {
-               existingManual = existingMatches.find(m => 
-                   !m.isBonusOnly && 
-                   ((m.teamA === teamA && m.teamB === teamB) || (m.teamA === teamB && m.teamB === teamA)) && 
-                   m.stage === stage
-               );
-               if (existingManual) {
-                   let manualScoreChanged = false;
-                   if (existingManual.teamA === teamA) {
-                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsA || existingManual.fullGoalsB !== fullGoalsB);
-                   } else {
-                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsB || existingManual.fullGoalsB !== fullGoalsA);
-                   }
-                   if (existingManual.matchStatus === "FINISHED" && match.status === "FINISHED" && !manualScoreChanged) continue;
-                   editId = existingManual.db_id;
-               }
-           }
-
-           const matchDate = match.utcDate ? match.utcDate.split('T')[0] : null;
-
-           let overallWinner = null;
-           if (match.score?.winner === "HOME_TEAM" || match.score?.winner === "HOME") {
-               overallWinner = teamA;
-           } else if (match.score?.winner === "AWAY_TEAM" || match.score?.winner === "AWAY") {
-               overallWinner = teamB;
-           } else {
-               const duration = match.score?.duration;
-               if (duration === "PENALTY_SHOOTOUT" && match.score?.penalties) {
-                   overallWinner = match.score.penalties.home > match.score.penalties.away ? teamA : teamB;
-               } else if (duration === "EXTRA_TIME" && match.score?.extraTime) {
-                   overallWinner = match.score.fullTime.home > match.score.fullTime.away ? teamA : teamB;
-               } else {
-                   if (regGoalsA > regGoalsB) overallWinner = teamA;
-                   else if (regGoalsA < regGoalsB) overallWinner = teamB;
-               }
-           }
-
+           // 1. Calculate intended bonuses
            let calculatedBonusA = 0;
            let calculatedBonusB = 0;
 
@@ -573,29 +625,77 @@ const worker = {
                    if (clinchingMatches[apiId][teamB]) calculatedBonusB = 12;
                }
            } else if (["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS"].includes(stageStr)) {
+               let overallWinner = null;
+               if (match.score?.winner === "HOME_TEAM" || match.score?.winner === "HOME") overallWinner = teamA;
+               else if (match.score?.winner === "AWAY_TEAM" || match.score?.winner === "AWAY") overallWinner = teamB;
+               else {
+                   const duration = match.score?.duration;
+                   if (duration === "PENALTY_SHOOTOUT" && match.score?.penalties) overallWinner = match.score.penalties.home > match.score.penalties.away ? teamA : teamB;
+                   else if (duration === "EXTRA_TIME" && match.score?.extraTime) overallWinner = match.score.fullTime.home > match.score.fullTime.away ? teamA : teamB;
+                   else {
+                       if (regGoalsA > regGoalsB) overallWinner = teamA;
+                       else if (regGoalsA < regGoalsB) overallWinner = teamB;
+                   }
+               }
+
                if (overallWinner === teamA) calculatedBonusA = 12;
                if (overallWinner === teamB) calculatedBonusB = 12;
            } else if (stageStr === "THIRD_PLACE") {
+               let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
                if (overallWinner === teamA) calculatedBonusA = 5;
                if (overallWinner === teamB) calculatedBonusB = 5;
            } else if (stageStr === "FINAL") {
+               let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
                if (overallWinner === teamA) calculatedBonusA = 20;
                if (overallWinner === teamB) calculatedBonusB = 20;
            }
 
-           // Protect manual bonuses so they are never wiped out
+           let editId = null;
+           const existingByApiId = existingMatches.find(m => m.api_match_id === apiId);
+           let existingManual = null;
+           
            if (existingByApiId) {
+               // 🚀 CRITICAL FIX: Ensure the API doesn't skip matches that are missing a calculated bonus!
                if (calculatedBonusA === 0 && Number(existingByApiId.bonusA) > 0) calculatedBonusA = Number(existingByApiId.bonusA);
                if (calculatedBonusB === 0 && Number(existingByApiId.bonusB) > 0) calculatedBonusB = Number(existingByApiId.bonusB);
-           } else if (existingManual) {
-               if (existingManual.teamA === teamA) {
-                   if (calculatedBonusA === 0 && Number(existingManual.bonusA) > 0) calculatedBonusA = Number(existingManual.bonusA);
-                   if (calculatedBonusB === 0 && Number(existingManual.bonusB) > 0) calculatedBonusB = Number(existingManual.bonusB);
-               } else {
-                   if (calculatedBonusA === 0 && Number(existingManual.bonusB) > 0) calculatedBonusA = Number(existingManual.bonusB);
-                   if (calculatedBonusB === 0 && Number(existingManual.bonusA) > 0) calculatedBonusB = Number(existingManual.bonusA);
+
+               let scoreChanged = (existingByApiId.fullGoalsA !== fullGoalsA || existingByApiId.fullGoalsB !== fullGoalsB || existingByApiId.regGoalsA !== regGoalsA || existingByApiId.regGoalsB !== regGoalsB);
+               let bonusChanged = (Number(existingByApiId.bonusA) !== calculatedBonusA || Number(existingByApiId.bonusB) !== calculatedBonusB);
+
+               if (existingByApiId.matchStatus === "FINISHED" && match.status === "FINISHED" && !scoreChanged && !bonusChanged) continue;
+               editId = existingByApiId.db_id; 
+           } else {
+               existingManual = existingMatches.find(m => 
+                   !m.isBonusOnly && 
+                   ((m.teamA === teamA && m.teamB === teamB) || (m.teamA === teamB && m.teamB === teamA)) && 
+                   m.stage === stage
+               );
+               if (existingManual) {
+                   if (existingManual.teamA === teamA) {
+                       if (calculatedBonusA === 0 && Number(existingManual.bonusA) > 0) calculatedBonusA = Number(existingManual.bonusA);
+                       if (calculatedBonusB === 0 && Number(existingManual.bonusB) > 0) calculatedBonusB = Number(existingManual.bonusB);
+                   } else {
+                       if (calculatedBonusA === 0 && Number(existingManual.bonusB) > 0) calculatedBonusA = Number(existingManual.bonusB);
+                       if (calculatedBonusB === 0 && Number(existingManual.bonusA) > 0) calculatedBonusB = Number(existingManual.bonusA);
+                   }
+
+                   let manualScoreChanged = false;
+                   let bonusChanged = false;
+
+                   if (existingManual.teamA === teamA) {
+                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsA || existingManual.fullGoalsB !== fullGoalsB);
+                       bonusChanged = (Number(existingManual.bonusA) !== calculatedBonusA || Number(existingManual.bonusB) !== calculatedBonusB);
+                   } else {
+                       manualScoreChanged = (existingManual.fullGoalsA !== fullGoalsB || existingManual.fullGoalsB !== fullGoalsA);
+                       bonusChanged = (Number(existingManual.bonusA) !== calculatedBonusB || Number(existingManual.bonusB) !== calculatedBonusA);
+                   }
+
+                   if (existingManual.matchStatus === "FINISHED" && match.status === "FINISHED" && !manualScoreChanged && !bonusChanged) continue;
+                   editId = existingManual.db_id;
                }
            }
+
+           const matchDate = match.utcDate ? match.utcDate.split('T')[0] : null;
 
            let apiMinute = match.minute || match.score?.minute || null;
            if (!apiMinute && match.status === "IN_PLAY") {
@@ -624,7 +724,7 @@ const worker = {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>World Cup 2026 Dashboard</title>
+      <title>🏆 World Cup 2026 DB03 Dashboard</title>
       <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f3f4f6; color: #1f2937; padding: 2rem; margin: 0; }
@@ -632,10 +732,20 @@ const worker = {
         h1 { grid-column: span 2; text-align: center; color: #111827; margin-bottom: 1rem; }
         .card { background: white; padding: 1.5rem; border-collapse: collapse; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); min-width: 0; }
         h2 { margin-top: 0; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 0.5rem; }
+        
         table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
         th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #e5e7eb; }
         th { background-color: #2563eb; color: white; font-weight: 600; white-space: nowrap; }
         .leaderboard-table tr:hover { background-color: #eff6ff; cursor: pointer; }
+        
+        .group-table { width: 100%; border-collapse: collapse; margin-top: 0; table-layout: fixed; min-width: 650px; }
+        .group-table th, .group-table td { padding: 0.75rem 0.5rem; vertical-align: middle; border-bottom: 1px solid #e5e7eb; }
+        .group-table th.col-rank, .group-table td.col-rank { width: 5%; text-align: center; font-weight: 900; }
+        .group-table th.col-team, .group-table td.col-team { width: 25%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .group-table th.col-stat, .group-table td.col-stat { width: 7%; text-align: center; }
+        .group-table th.col-pts, .group-table td.col-pts { width: 8%; text-align: center; font-weight: bold; }
+        .group-table th.col-status, .group-table td.col-status { width: 15%; text-align: center; }
+        
         .rank { font-weight: bold; color: #2563eb; }
         .active-row { background-color: #dbeafe !important; }
         .empty-state { text-align: center; color: #6b7280; padding: 2rem; }
@@ -739,7 +849,21 @@ const worker = {
     </head>
     <body>
       <div class="container">
-        <h1>🏆 World Cup 2026 Dashboard</h1>
+        <h1>🏆 World Cup 2026 DB03 Dashboard</h1>
+
+        <div style="grid-column: span 2; background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; border-left: 4px solid #8b5cf6;">
+           <div>
+              <h3 style="margin: 0 0 0.5rem 0; color: #1f2937;">⚡ Advancement Bonus Logic (+12)</h3>
+              <p style="margin: 0; font-size: 0.85rem; color: #6b7280;">Choose how to display and calculate the Group Stage advancement points.</p>
+           </div>
+           <div style="display: flex; gap: 1rem; align-items: center;">
+              <select id="frontend-logic-toggle" style="padding: 0.75rem; border-radius: 6px; border: 1px solid #d1d5db; background: #f9fafb; font-weight: bold; color: #1f2937; cursor: pointer; min-width: 250px;">
+                 <option value="immediate">Immediate (Baked into Match)</option>
+                 <option value="separate">End of Group Stage (Separate Record)</option>
+              </select>
+              <button onclick="applyLogicToggle()" style="background: #8b5cf6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; font-weight: bold; cursor: pointer; transition: background 0.2s;">Apply Changes</button>
+           </div>
+        </div>
         
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -760,18 +884,6 @@ const worker = {
         <div class="card admin-panel" style="margin-bottom: 0;">
           <h2 id="panel-title">🤖 Auto-Sync Match Results (football-data.org)</h2>
           <div class="match-setup">
-            
-            <div class="form-row" style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #374151;">
-              <div class="form-group" style="flex: 1;">
-                <label for="bonus-logic-select" style="color: #60a5fa;">⚡ Advancement Bonus Logic (+12)</label>
-                <select id="bonus-logic-select" onchange="updateBonusLogic()" style="border-color: #60a5fa; background-color: #1e3a8a;">
-                  <option value="immediate">Immediate (Retroactively attach to latest Group Match)</option>
-                  <option value="separate">End of Group Stage (Create a Separate Record after 3 games)</option>
-                </select>
-                <p style="font-size: 0.75rem; color: #9ca3af; margin-top: 4px; margin-bottom: 0;">Choose how auto-sync awards the +12 advancement points.</p>
-              </div>
-            </div>
-
             <div class="form-row" style="align-items: flex-end;">
               <div class="form-group" style="flex: 2;">
                 <label>API Key</label>
@@ -903,6 +1015,40 @@ const worker = {
             }
         }, 60000);
 
+        function applyLogicToggle() {
+           const logic = document.getElementById('frontend-logic-toggle').value;
+           const btn = document.querySelector('button[onclick="applyLogicToggle()"]');
+           btn.innerText = "⏳ Recalculating...";
+           btn.disabled = true;
+
+           fetch('/api/recalculate', {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({ logic: logic })
+           })
+           .then(res => res.json())
+           .then(data => {
+               if (data.success) {
+                   loadLeaderboard();
+                   loadHistory();
+               } else alert("Error: " + data.error);
+           })
+           .catch(console.error)
+           .finally(() => {
+               btn.innerText = "Apply Changes";
+               btn.disabled = false;
+           });
+        }
+
+        function loadSettings() {
+           fetch('/api/settings').then(res => res.json()).then(data => {
+               if(data.bonus_logic) {
+                   const toggle = document.getElementById('frontend-logic-toggle');
+                   if(toggle) toggle.value = data.bonus_logic;
+               }
+           }).catch(console.error);
+        }
+
         function updateStatusUI() {
             const status = document.getElementById('match-status').value;
             const minInput = document.getElementById('match-minute');
@@ -966,25 +1112,6 @@ const worker = {
         document.getElementById('reg-goals-b').addEventListener('input', updateExtraTimeUI);
         document.getElementById('full-goals-a').addEventListener('input', autoFillBonus);
         document.getElementById('full-goals-b').addEventListener('input', autoFillBonus);
-
-        // 🚀 SETTINGS: Load saved logic choice
-        function loadSettings() {
-            fetch('/api/settings').then(res => res.json()).then(data => {
-                if(data.bonus_logic) {
-                    document.getElementById('bonus-logic-select').value = data.bonus_logic;
-                }
-            }).catch(console.error);
-        }
-
-        // 🚀 SETTINGS: Save choice when user changes toggle
-        function updateBonusLogic() {
-            const val = document.getElementById('bonus-logic-select').value;
-            fetch('/api/settings', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ key: 'bonus_logic', value: val })
-            });
-        }
 
         function loadLeaderboard() {
           fetch('/api/leaderboard').then(res => res.json()).then(data => {
@@ -1139,6 +1266,8 @@ const worker = {
                     if (p.isBonusOnly) {
                         advancedTeams.add(p.teamA);
                     }
+                    if (Number(p.bonusA) >= 5) advancedTeams.add(p.teamA);
+                    if (Number(p.bonusB) >= 5) advancedTeams.add(p.teamB);
 
                     if (!p.isKnockout && !p.isBonusOnly && (!p.stage || p.stage === 'group')) {
                         if (!stats[p.teamA]) stats[p.teamA] = { mp: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, gd: 0, pts: 0, advanced: false };
@@ -1175,9 +1304,7 @@ const worker = {
                 
                 groupTeams.sort((a, b) => {
                     if (stats[b].pts !== stats[a].pts) return stats[b].pts - stats[a].pts;
-                    let gdA = stats[a].gf - stats[a].ga;
-                    let gdB = stats[b].gf - stats[b].ga;
-                    if (gdB !== gdA) return gdB - gdA;
+                    if (stats[b].gd !== stats[a].gd) return stats[b].gd - stats[a].gd;
                     return stats[b].gf - stats[a].gf;
                 });
 
@@ -1186,20 +1313,20 @@ const worker = {
                 let tableHtml = '<div style="margin-bottom: 2rem;">' +
                     '<h3 style="background: #1f2937; color: white; padding: 0.75rem; margin: 0; border-radius: 8px 8px 0 0; font-size: 1.1rem;">Group ' + groupLetter + '</h3>' +
                     '<div style="overflow-x: auto; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">' +
-                    '<table class="leaderboard-table" style="margin-top: 0;">' +
+                    '<table class="group-table">' +
                       '<thead style="background-color: #f9fafb; color: #4b5563;">' +
                         '<tr>' +
-                          '<th style="background: #f3f4f6; color: #374151;">#</th>' +
-                          '<th style="background: #f3f4f6; color: #374151;">Team</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">P</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">W</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">D</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">L</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">GF</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">GA</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">GD</th>' +
-                          '<th style="background: #f3f4f6; color: #374151; text-align:center;">PTS</th>' +
-                          '<th style="background: #f3f4f6; color: #374151;">Status</th>' +
+                          '<th class="col-rank" style="background: #f3f4f6; color: #374151;">#</th>' +
+                          '<th class="col-team" style="background: #f3f4f6; color: #374151;">Team</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">P</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">W</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">D</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">L</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">GF</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">GA</th>' +
+                          '<th class="col-stat" style="background: #f3f4f6; color: #374151;">GD</th>' +
+                          '<th class="col-pts" style="background: #f3f4f6; color: #374151;">PTS</th>' +
+                          '<th class="col-status" style="background: #f3f4f6; color: #374151;">Status</th>' +
                         '</tr>' +
                       '</thead>' +
                       '<tbody>';
@@ -1208,24 +1335,24 @@ const worker = {
                     const isTopTwo = index < 2;
                     const rowBg = isTopTwo ? '#f0fdf4' : 'white';
                     const rowBorder = isTopTwo ? 'border-left: 4px solid #10b981;' : 'border-left: 4px solid transparent;';
-                    const rankStyle = isTopTwo ? 'color: #10b981; font-weight: 900; font-size: 1.1rem;' : 'color: #6b7280; font-weight: bold;';
+                    const rankStyle = isTopTwo ? 'color: #10b981;' : 'color: #6b7280;';
 
                     const gd = stats[team].gf - stats[team].ga;
                     const sign = gd > 0 ? '+' : '';
                     const statusHtml = stats[team].advanced ? '<span style="background:#10b981; color:white; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:bold;">✅ Advanced (+12)</span>' : '';
 
                     tableHtml += '<tr style="background: ' + rowBg + '; ' + rowBorder + '">' +
-                        '<td style="' + rankStyle + '">' + (index + 1) + '</td>' +
-                        '<td><strong>' + team + '</strong></td>' +
-                        '<td style="text-align:center;">' + stats[team].mp + '</td>' +
-                        '<td style="text-align:center;">' + stats[team].w + '</td>' +
-                        '<td style="text-align:center;">' + stats[team].d + '</td>' +
-                        '<td style="text-align:center;">' + stats[team].l + '</td>' +
-                        '<td style="text-align:center;">' + stats[team].gf + '</td>' +
-                        '<td style="text-align:center;">' + stats[team].ga + '</td>' +
-                        '<td style="text-align:center; color:' + (gd > 0 ? '#10b981' : (gd < 0 ? '#ef4444' : '#6b7280')) + '; font-weight:bold;">' + sign + gd + '</td>' +
-                        '<td style="text-align:center; font-size:1.1rem;"><strong>' + stats[team].pts + '</strong></td>' +
-                        '<td>' + statusHtml + '</td>' +
+                        '<td class="col-rank" style="' + rankStyle + '">' + (index + 1) + '</td>' +
+                        '<td class="col-team"><strong>' + team + '</strong></td>' +
+                        '<td class="col-stat">' + stats[team].mp + '</td>' +
+                        '<td class="col-stat">' + stats[team].w + '</td>' +
+                        '<td class="col-stat">' + stats[team].d + '</td>' +
+                        '<td class="col-stat">' + stats[team].l + '</td>' +
+                        '<td class="col-stat">' + stats[team].gf + '</td>' +
+                        '<td class="col-stat">' + stats[team].ga + '</td>' +
+                        '<td class="col-stat" style="color:' + (gd > 0 ? '#10b981' : (gd < 0 ? '#ef4444' : '#6b7280')) + '; font-weight:bold;">' + sign + gd + '</td>' +
+                        '<td class="col-pts" style="font-size:1.1rem;">' + stats[team].pts + '</td>' +
+                        '<td class="col-status">' + statusHtml + '</td>' +
                     '</tr>';
                 });
 
