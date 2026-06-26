@@ -48,26 +48,26 @@ git clone [https://github.com/YOUR_USERNAME/world-cup-app.git](https://github.co
 cd world-cup-app
 ```
 
-**2. Install Cloudflare Wrangler
+**2. Install Cloudflare Wrangler**
 ```bash
 npm install -g wrangler
 wrangler login
 ```
 
-**3. Set up the D1 Database
+**3. Set up the D1 Database**
 Create a new serverless database on Cloudflare:
 ```bash
 wrangler d1 create world-cup-db
 ```
 Note the database_name and database_id that the terminal outputs. Update your wrangler.jsonc file with these exact credentials.
 
-**4. Add your API Key as a Secret
+**4. Add your API Key as a Secret**
 Store your football-data.org token securely in Cloudflare:
 ```bash
 wrangler secret put FOOTBALL_API_KEY
 ```
 
-**5. Deploy to Cloudflare
+**5. Deploy to Cloudflare**
 ```bash
 wrangler deploy
 ```
