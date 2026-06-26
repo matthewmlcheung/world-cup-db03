@@ -46,3 +46,54 @@ Fixing Mistakes: If you ever make a mistake or data drifts, use the "🔄 Fix Ma
 ```bash
 git clone [https://github.com/YOUR_USERNAME/world-cup-app.git](https://github.com/YOUR_USERNAME/world-cup-app.git)
 cd world-cup-app
+```
+
+**2. Install Cloudflare Wrangler
+```bash
+npm install -g wrangler
+wrangler login
+```
+
+**3. Set up the D1 Database
+Create a new serverless database on Cloudflare:
+```bash
+wrangler d1 create world-cup-db
+```
+Note the database_name and database_id that the terminal outputs. Update your wrangler.jsonc file with these exact credentials.
+
+**4. Add your API Key as a Secret
+Store your football-data.org token securely in Cloudflare:
+```bash
+wrangler secret put FOOTBALL_API_KEY
+```
+
+**5. Deploy to Cloudflare
+```bash
+wrangler deploy
+```
+
+⚙️ Configuration (wrangler.jsonc)
+Make sure your wrangler.jsonc file includes the necessary bindings for the AI and the Database. It should look something like this:
+```
+{
+  "name": "world-cup-app",
+  "main": "src/index.js",
+  "compatibility_date": "2024-03-20",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "world-cup-db",
+      "database_id": "YOUR-DATABASE-ID-HERE"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"] // Auto-syncs every 5 minutes
+  }
+}
+```
+
+📝 License
+This project is open-source and available under the MIT License.
