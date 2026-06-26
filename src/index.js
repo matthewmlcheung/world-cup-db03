@@ -31,13 +31,14 @@ const worker = {
 
     const ensureTables = async () => {
       await env.DB.prepare("CREATE TABLE IF NOT EXISTS MatchHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, log_text TEXT, score_deltas TEXT, match_data TEXT, display_order INTEGER, match_date TEXT, api_match_id INTEGER UNIQUE, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)").run();
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS Settings (key TEXT PRIMARY KEY, value TEXT)").run();
       try { await env.DB.prepare("ALTER TABLE MatchHistory ADD COLUMN match_date TEXT").run(); } catch (e) {}
       try { await env.DB.prepare("ALTER TABLE MatchHistory ADD COLUMN api_match_id INTEGER").run(); } catch (e) {}
     };
 
     // --- CORE MATH ENGINE ---
     const processMatch = async (env, payload, teamRegions) => {
-      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute, goals } = payload;
+      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
       const isKnockout = stage ? stage.startsWith('knockout') : payload.isKnockout;
       const isMutualFundActive = stage === 'knockout_late';
       const statements = [];
@@ -77,6 +78,7 @@ const worker = {
       let pureBonusA = Number(bonusA || 0);
       let pureBonusB = Number(bonusB || 0);
 
+      // UNIFIED BASE BOND (Pure + Bonus)
       let baseBondA = pureBondA + pureBonusA;
       let baseBondB = pureBondB + pureBonusB;
 
@@ -98,7 +100,7 @@ const worker = {
       const aggregatedPlayerUpdates = {};
 
       bets.forEach(bet => {
-        let w = bet.bet_amount;
+        let w = Number(bet.bet_amount);
         let scoreChange = 0;
         
         let bondMult = (w === -1 || w === 0.5 || w === 1) ? w : ((w === 2 || w === 3) ? (isKnockout ? 2 : 1) : 0);
@@ -209,6 +211,53 @@ const worker = {
     };
 
     // --- API ENDPOINTS ---
+    
+    if (request.method === "GET" && url.pathname === "/api/settings") {
+      try {
+        await ensureTables();
+        const row = await env.DB.prepare("SELECT value FROM Settings WHERE key = 'bonus_logic'").first();
+        return new Response(JSON.stringify({ bonus_logic: row ? row.value : 'immediate' }), { headers: { "Content-Type": "application/json" } });
+      } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/settings") {
+      try {
+        await ensureTables();
+        const { key, value } = await request.json();
+        await env.DB.prepare("INSERT OR REPLACE INTO Settings (key, value) VALUES (?, ?)").bind(key, value).run();
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/recalculate") {
+      try {
+        await env.DB.prepare("UPDATE Players SET score = 0").run();
+        const { results: history } = await env.DB.prepare("SELECT score_deltas FROM MatchHistory").all();
+        
+        const playerTotals = {};
+        history.forEach(row => {
+            if (row.score_deltas) {
+                const deltas = JSON.parse(row.score_deltas);
+                for (const [pName, change] of Object.entries(deltas)) {
+                    playerTotals[pName] = (playerTotals[pName] || 0) + change;
+                }
+            }
+        });
+
+        const statements = [];
+        for (const [pName, total] of Object.entries(playerTotals)) {
+            statements.push(env.DB.prepare("UPDATE Players SET score = ? WHERE name = ?").bind(total, pName));
+        }
+        
+        if (statements.length > 0) {
+            await env.DB.batch(statements);
+        }
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/api/leaderboard") {
       try {
         const { results } = await env.DB.prepare("SELECT * FROM Players ORDER BY score DESC").all();
@@ -244,17 +293,15 @@ const worker = {
         const explicitBetsString = bets.map(b => `${b.team_name} (${b.bet_amount}x)`).join(', ');
         
         let systemPrompt = 'You are a highly analytical Wall Street sports trader. Provide a strategic asset review of this World Cup portfolio (up to 8 sentences). Call out the explicit multiplier numbers inside the parentheses. Highlight exactly which specific team picks are driving their main successes or failures based on soccer logic. Avoid generic platitudes.';
-        let maxTokensLimit = 400; 
+        let maxTokensLimit = 1500; 
 
         if (mode === "toxic") {
             systemPrompt = 'You are a witty, extremely savage, and casually mean sports portfolio roaster. Roast the user\'s specific World Cup betting portfolio in exactly ONE short, brutal English sentence. Be funny, ruthless, and drop all professionalism. Keep your response under 35 words so it does not get cut off.';
-            maxTokensLimit = 200;
         } else if (mode === "profile") {
             systemPrompt = 'You are an insightful behavioral psychologist. Based on this user\'s specific World Cup portfolio and rank, summarize their personality in exactly ONE short sentence. Guess their character or real-life traits based on how they invest (e.g. reckless, conservative, trend-chaser). Keep your response under 35 words so it does not get cut off.';
-            maxTokensLimit = 200;
         }
 
-        const aiResponse = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
+        const aiResponse = await env.AI.run('@cf/qwen/qwen3-30b-a3b-fp8', {
           max_tokens: maxTokensLimit,
           messages: [
             { role: 'system', content: systemPrompt },
@@ -368,6 +415,16 @@ const worker = {
         const allMatches = data.matches || [];
         let newMatchesCount = 0;
 
+        const apiNameMapper = { 
+            "USA": "United States", "Korea Republic": "South Korea", "Czechia": "Czech Republic", 
+            "Côte d'Ivoire": "Ivory Coast", "Congo DR": "DR Congo", "Cape Verde Islands": "Cape Verde",
+            "Cabo Verde": "Cape Verde", "Türkiye": "Turkey", "Curacao": "Curaçao",
+            "Bosnia-Herzegovina": "Bosnia and Herzegovina", "IR Iran": "Iran"
+        };
+
+        const settingRow = await env.DB.prepare("SELECT value FROM Settings WHERE key = 'bonus_logic'").first();
+        const bonusLogic = settingRow ? settingRow.value : 'immediate';
+
         const { results: existingRows } = await env.DB.prepare("SELECT id, api_match_id, match_data FROM MatchHistory").all();
         
         const existingMatches = existingRows.map(r => {
@@ -378,6 +435,14 @@ const worker = {
                return parsed;
            } catch(e){ return {}; }
         });
+
+        const getTodayString = () => {
+            const d = new Date();
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return year + "-" + month + "-" + day;
+        };
 
         const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
         const advancedTeams = new Set();
@@ -390,6 +455,8 @@ const worker = {
         });
 
         const clinchingMatches = {}; 
+        const standaloneBonusesToProcess = [];
+
         advancedTeams.forEach(team => {
             const groupMatches = allMatches.filter(m => 
                 (m.stage === "GROUP_STAGE" || m.stage === "group") && 
@@ -397,12 +464,34 @@ const worker = {
                 ((apiNameMapper[m.homeTeam?.name] || m.homeTeam?.name) === team || (apiNameMapper[m.awayTeam?.name] || m.awayTeam?.name) === team)
             );
             groupMatches.sort((a, b) => new Date(b.utcDate).getTime() - new Date(a.utcDate).getTime());
-            if (groupMatches.length > 0) {
-                const lastMatch = groupMatches[0];
-                if (!clinchingMatches[lastMatch.id]) clinchingMatches[lastMatch.id] = {};
-                clinchingMatches[lastMatch.id][team] = 12;
+            
+            if (bonusLogic === 'immediate') {
+                if (groupMatches.length > 0) {
+                    const lastMatch = groupMatches[0];
+                    if (!clinchingMatches[lastMatch.id]) clinchingMatches[lastMatch.id] = {};
+                    clinchingMatches[lastMatch.id][team] = 12;
+                }
+            } else {
+                if (groupMatches.length >= 3) {
+                    standaloneBonusesToProcess.push(team);
+                }
             }
         });
+
+        // 🚀 NEW: Process separate standalone bonus records
+        for (const team of standaloneBonusesToProcess) {
+           const existingBonus = existingMatches.find(m => m.isBonusOnly && m.teamA === team);
+           if (!existingBonus) {
+               const payload = {
+                  teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
+                  teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
+                  stage: 'group', matchDate: getTodayString(), apiMatchId: null, isKnockout: false, isBonusOnly: true,
+                  matchStatus: "FINISHED", matchMinute: null, editId: null
+               };
+               await processMatch(env, payload, teamRegions);
+               newMatchesCount++;
+           }
+        }
 
         const targetStatuses = ["IN_PLAY", "PAUSED", "FINISHED"];
         const activeMatches = allMatches.filter(m => targetStatuses.includes(m.status));
@@ -494,6 +583,20 @@ const worker = {
                if (overallWinner === teamB) calculatedBonusB = 20;
            }
 
+           // Protect manual bonuses so they are never wiped out
+           if (existingByApiId) {
+               if (calculatedBonusA === 0 && Number(existingByApiId.bonusA) > 0) calculatedBonusA = Number(existingByApiId.bonusA);
+               if (calculatedBonusB === 0 && Number(existingByApiId.bonusB) > 0) calculatedBonusB = Number(existingByApiId.bonusB);
+           } else if (existingManual) {
+               if (existingManual.teamA === teamA) {
+                   if (calculatedBonusA === 0 && Number(existingManual.bonusA) > 0) calculatedBonusA = Number(existingManual.bonusA);
+                   if (calculatedBonusB === 0 && Number(existingManual.bonusB) > 0) calculatedBonusB = Number(existingManual.bonusB);
+               } else {
+                   if (calculatedBonusA === 0 && Number(existingManual.bonusB) > 0) calculatedBonusA = Number(existingManual.bonusB);
+                   if (calculatedBonusB === 0 && Number(existingManual.bonusA) > 0) calculatedBonusB = Number(existingManual.bonusA);
+               }
+           }
+
            let apiMinute = match.minute || match.score?.minute || null;
            if (!apiMinute && match.status === "IN_PLAY") {
                if (existingByApiId && existingByApiId.matchMinute) apiMinute = existingByApiId.matchMinute;
@@ -516,8 +619,7 @@ const worker = {
     }
 
     // --- DASHBOARD HTML ---
-    const html = `
-    <!DOCTYPE html>
+    const html = `<!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
@@ -560,6 +662,8 @@ const worker = {
         .btn-danger:hover { background: #dc2626; }
         .btn-warning { background: #f59e0b; flex: 3; }
         .btn-warning:hover { background: #d97706; }
+        .btn-purple { background: #8b5cf6; flex: 1; }
+        .btn-purple:hover { background: #7c3aed; }
         
         .btn-action { color: white; font-size: 0.8rem; padding: 0.5rem 1rem; border-radius: 4px; border: none; cursor: pointer; width: 100%; }
         .btn-action.undo { background: #ef4444; }
@@ -635,7 +739,7 @@ const worker = {
     </head>
     <body>
       <div class="container">
-        <h1>🏆 World Cup 2026 DB03 Dashboard</h1>
+        <h1>🏆 World Cup 2026 Dashboard</h1>
         
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -656,6 +760,18 @@ const worker = {
         <div class="card admin-panel" style="margin-bottom: 0;">
           <h2 id="panel-title">🤖 Auto-Sync Match Results (football-data.org)</h2>
           <div class="match-setup">
+            
+            <div class="form-row" style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #374151;">
+              <div class="form-group" style="flex: 1;">
+                <label for="bonus-logic-select" style="color: #60a5fa;">⚡ Advancement Bonus Logic (+12)</label>
+                <select id="bonus-logic-select" onchange="updateBonusLogic()" style="border-color: #60a5fa; background-color: #1e3a8a;">
+                  <option value="immediate">Immediate (Retroactively attach to latest Group Match)</option>
+                  <option value="separate">End of Group Stage (Create a Separate Record after 3 games)</option>
+                </select>
+                <p style="font-size: 0.75rem; color: #9ca3af; margin-top: 4px; margin-bottom: 0;">Choose how auto-sync awards the +12 advancement points.</p>
+              </div>
+            </div>
+
             <div class="form-row" style="align-items: flex-end;">
               <div class="form-group" style="flex: 2;">
                 <label>API Key</label>
@@ -712,8 +828,10 @@ const worker = {
               <div class="form-group"><label>Goals (120m)</label><input type="number" id="full-goals-b" value="0" min="0"></div>
               <div class="form-group"><label>Bonus</label><select id="bonus-b"><option value="0">None</option><option value="12">Advance (+12)</option><option value="5">3rd Place (+5)</option><option value="20">Championship (+20)</option></select></div>
             </div>
+
             <div class="button-group">
               <button id="submit-btn" class="btn-primary" onclick="submitMatch()">Calculate Match & Update Leaderboard</button>
+              <button class="btn-purple" id="recalc-btn" onclick="recalculateScores()">🔄 Fix Math (Recalculate All)</button>
               <button id="cancel-edit-btn" class="btn-danger" style="display:none;" onclick="cancelEdit()">Cancel Edit</button>
               <button class="btn-danger" id="reset-btn" onclick="resetScores()">🚨 Reset System</button>
             </div>
@@ -848,6 +966,25 @@ const worker = {
         document.getElementById('reg-goals-b').addEventListener('input', updateExtraTimeUI);
         document.getElementById('full-goals-a').addEventListener('input', autoFillBonus);
         document.getElementById('full-goals-b').addEventListener('input', autoFillBonus);
+
+        // 🚀 SETTINGS: Load saved logic choice
+        function loadSettings() {
+            fetch('/api/settings').then(res => res.json()).then(data => {
+                if(data.bonus_logic) {
+                    document.getElementById('bonus-logic-select').value = data.bonus_logic;
+                }
+            }).catch(console.error);
+        }
+
+        // 🚀 SETTINGS: Save choice when user changes toggle
+        function updateBonusLogic() {
+            const val = document.getElementById('bonus-logic-select').value;
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ key: 'bonus_logic', value: val })
+            });
+        }
 
         function loadLeaderboard() {
           fetch('/api/leaderboard').then(res => res.json()).then(data => {
@@ -1186,6 +1323,27 @@ const worker = {
           });
         }
 
+        function recalculateScores() {
+            if(confirm("Are you sure you want to recalculate the entire leaderboard? This will perfectly fix any math errors!")) {
+                const btn = document.getElementById('recalc-btn');
+                btn.innerText = "⏳ Fixing...";
+                btn.disabled = true;
+                
+                fetch('/api/recalculate', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if(data.success) {
+                        alert("✅ Leaderboard successfully recalculated! The math is now perfect.");
+                        loadLeaderboard();
+                    } else alert("Error: " + data.error);
+                }).catch(console.error)
+                .finally(() => {
+                    btn.innerText = "🔄 Fix Math (Recalculate All)";
+                    btn.disabled = false;
+                });
+            }
+        }
+
         window.roastPlayer = function(name) {
             const container = document.getElementById('ai-analysis-container');
             container.innerHTML = '<span class="live-indicator" style="color: #ef4444; font-weight: bold;">🔥 Cooking the roast...</span>';
@@ -1374,7 +1532,7 @@ const worker = {
 
                       if (payload.isBonusOnly) {
                           bets.forEach(bet => {
-                            if (bet.team_name === payload.teamA) notesArr.push(buildReceiptRow(payload.teamA, bet.bet_amount, 0, pureBonusA, 0, false, false, true));
+                            if (bet.team_name === payload.teamA) notesArr.push(buildReceiptRow(payload.teamA, Number(bet.bet_amount), 0, pureBonusA, 0, false, false, true));
                           });
                           
                           detailsHtml = '<div style="padding: 16px; text-align: left;">' +
@@ -1412,7 +1570,7 @@ const worker = {
                           const regB = teamRegions[payload.teamB];
 
                           bets.forEach(bet => {
-                            let w = bet.bet_amount;
+                            let w = Number(bet.bet_amount);
                             if (bet.team_name === payload.teamA) notesArr.push(buildReceiptRow(payload.teamA, w, pureBondA, pureBonusA, callA, isKo, false, false));
                             if (isMf && bet.team_name === regA) notesArr.push(buildReceiptRow(regA, w, pureBondA, pureBonusA, callA, isKo, true, false));
                             
@@ -1500,7 +1658,6 @@ const worker = {
 
             detailsContent.innerHTML = html;
 
-            // Trigger the initial standard fetch
             fetch('/api/analysis/' + encodeURIComponent(name))
               .then(res => res.json())
               .then(data => {
@@ -1662,6 +1819,11 @@ const worker = {
 
           const actionText = currentEditId ? "Update Match" : "Confirm Match Result";
           if (confirm(actionText + ": " + payload.teamA + " vs " + payload.teamB + "?")) {
+            
+            const submitBtn = document.getElementById('submit-btn');
+            submitBtn.disabled = true;
+            submitBtn.innerText = "⏳ Saving...";
+
             fetch('/api/match', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
             .then(res => res.json()).then(data => {
               if (data.success) {
@@ -1669,7 +1831,11 @@ const worker = {
                 loadLeaderboard();
                 loadHistory();
               } else alert('Error: ' + data.error);
-            }).catch(console.error);
+            }).catch(console.error)
+            .finally(() => {
+                submitBtn.disabled = false;
+                submitBtn.innerText = currentEditId ? "✅ Update Match Result" : "Calculate Match & Update Leaderboard";
+            });
           }
         }
 
@@ -1682,7 +1848,10 @@ const worker = {
         }
 
         document.getElementById('match-date').value = getTodayString();
-        loadLeaderboard(); loadTeams(); loadHistory();
+        loadSettings();
+        loadLeaderboard(); 
+        loadTeams(); 
+        loadHistory();
         updateStatusUI();
         updateExtraTimeUI();
       </script>
