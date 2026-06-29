@@ -37,25 +37,14 @@ const worker = {
     };
 
     // --- CORE MATH ENGINE ---
-    const processMatch = async (env, payload, teamRegions, originalPayloadForDb = null) => {
-      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, editId, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
+    const computeMatchData = (payload, bets, teamRegions, originalPayloadForDb = null) => {
+      let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
       const isKnockout = stage ? stage.startsWith('knockout') : payload.isKnockout;
       const isMutualFundActive = stage === 'knockout_late';
-      const statements = [];
 
       if (!isKnockout && !isBonusOnly) {
           regGoalsA = fullGoalsA;
           regGoalsB = fullGoalsB;
-      }
-
-      if (editId) {
-        const oldRow = await env.DB.prepare("SELECT score_deltas FROM MatchHistory WHERE id = ?").bind(editId).first();
-        if (oldRow && oldRow.score_deltas) {
-          const oldDeltas = JSON.parse(oldRow.score_deltas);
-          for (const [pName, change] of Object.entries(oldDeltas)) {
-            statements.push(env.DB.prepare("UPDATE Players SET score = score - ? WHERE name = ?").bind(change, pName));
-          }
-        }
       }
 
       let pureBondA = 0, pureBondB = 0, callOptionA = 0, callOptionB = 0;
@@ -78,60 +67,42 @@ const worker = {
       let pureBonusA = Number(bonusA || 0);
       let pureBonusB = Number(bonusB || 0);
 
-      // UNIFIED BASE BOND (Pure + Bonus)
-      let baseBondA = pureBondA + pureBonusA;
-      let baseBondB = pureBondB + pureBonusB;
-
       const regionA = teamRegions[teamA];
       const regionB = teamRegions[teamB];
       
-      const queryTeams = [teamA, teamB];
-      if (isMutualFundActive) {
-        if (regionA) queryTeams.push(regionA);
-        if (regionB) queryTeams.push(regionB);
-      }
-      
-      const distinctTeams = [...new Set(queryTeams)];
-      const placeholders = distinctTeams.map(() => '?').join(',');
-
-      const { results: bets } = await env.DB.prepare(`SELECT player_name, team_name, bet_amount FROM Bets WHERE team_name IN (${placeholders})`).bind(...distinctTeams).all();
-      
       const scoreDeltas = {};
-      const aggregatedPlayerUpdates = {};
+      const playerUpdates = {};
 
       bets.forEach(bet => {
         let w = Number(bet.bet_amount);
         let scoreChange = 0;
         
         let bondMult = (w === -1 || w === 0.5 || w === 1) ? w : ((w === 2 || w === 3) ? (isKnockout ? 2 : 1) : 0);
+        let bonusMult = (w === -1 || w === 0.5 || w === 1) ? w : ((w === 2 || w === 3) ? (isKnockout ? 2 : 1) : 0);
         
         if (bet.team_name === teamA) {
-          scoreChange += baseBondA * bondMult;
-          if (w === 3) scoreChange += callOptionA;
+          scoreChange += (pureBondA * bondMult) + (pureBonusA * bonusMult);
+          if (w === 3 && !isBonusOnly) scoreChange += callOptionA;
         }
         
         if (isMutualFundActive && bet.team_name === regionA) {
-          scoreChange += baseBondA * w; 
+          scoreChange += (pureBondA + pureBonusA) * w; 
         }
         
         if (bet.team_name === teamB) {
-          scoreChange += baseBondB * bondMult;
-          if (w === 3) scoreChange += callOptionB;
+          scoreChange += (pureBondB * bondMult) + (pureBonusB * bonusMult);
+          if (w === 3 && !isBonusOnly) scoreChange += callOptionB;
         }
         
         if (isMutualFundActive && bet.team_name === regionB) {
-          scoreChange += baseBondB * w;
+          scoreChange += (pureBondB + pureBonusB) * w;
         }
 
         if (scoreChange !== 0) {
           scoreDeltas[bet.player_name] = (scoreDeltas[bet.player_name] || 0) + scoreChange;
-          aggregatedPlayerUpdates[bet.player_name] = (aggregatedPlayerUpdates[bet.player_name] || 0) + scoreChange;
+          playerUpdates[bet.player_name] = (playerUpdates[bet.player_name] || 0) + scoreChange;
         }
       });
-
-      for (const [pName, change] of Object.entries(aggregatedPlayerUpdates)) {
-        statements.push(env.DB.prepare("UPDATE Players SET score = score + ? WHERE name = ?").bind(change, pName));
-      }
 
       let stageStr = "Group Stage";
       if (stage === 'knockout_early') stageStr = "Knockout (R32/R16)";
@@ -139,7 +110,6 @@ const worker = {
       if (!stage && isKnockout) stageStr = "Knockout Stage";
 
       let logText = "";
-      
       if (isBonusOnly) {
           logText = `
             <div style="margin-bottom: 0.5rem; font-size: 1.1rem; color: #111827;">
@@ -198,16 +168,41 @@ const worker = {
       const deltasJson = JSON.stringify(scoreDeltas);
       const finalMatchDate = matchDate || null; 
 
-      if (editId) {
-        statements.push(env.DB.prepare("UPDATE MatchHistory SET log_text = ?, score_deltas = ?, match_data = ?, match_date = ?, api_match_id = ? WHERE id = ?").bind(logText, deltasJson, matchDataJson, finalMatchDate, apiMatchId || null, editId));
+      return { logText, deltasJson, matchDataJson, finalMatchDate, apiMatchId: apiMatchId || null, playerUpdates };
+    };
+
+    const processMatch = async (env, payload, teamRegions, originalPayloadForDb = null) => {
+      const isMutualFundActive = payload.stage === 'knockout_late';
+      const queryTeams = [payload.teamA, payload.teamB];
+      if (isMutualFundActive) {
+        if (teamRegions[payload.teamA]) queryTeams.push(teamRegions[payload.teamA]);
+        if (teamRegions[payload.teamB]) queryTeams.push(teamRegions[payload.teamB]);
+      }
+      const distinctTeams = [...new Set(queryTeams)];
+      const placeholders = distinctTeams.map(() => '?').join(',');
+
+      const { results: bets } = await env.DB.prepare(`SELECT player_name, team_name, bet_amount FROM Bets WHERE team_name IN (${placeholders})`).bind(...distinctTeams).all();
+      const computed = computeMatchData(payload, bets, teamRegions, originalPayloadForDb);
+      
+      const statements = [];
+      if (payload.editId) {
+        const oldRow = await env.DB.prepare("SELECT score_deltas FROM MatchHistory WHERE id = ?").bind(payload.editId).first();
+        if (oldRow && oldRow.score_deltas) {
+          const oldDeltas = JSON.parse(oldRow.score_deltas);
+          for (const [pName, change] of Object.entries(oldDeltas)) {
+            statements.push(env.DB.prepare("UPDATE Players SET score = score - ? WHERE name = ?").bind(change, pName));
+          }
+        }
+        statements.push(env.DB.prepare("UPDATE MatchHistory SET log_text = ?, score_deltas = ?, match_data = ?, match_date = ?, api_match_id = ? WHERE id = ?").bind(computed.logText, computed.deltasJson, computed.matchDataJson, computed.finalMatchDate, computed.apiMatchId, payload.editId));
       } else {
-        const newDisplayOrder = Date.now();
-        statements.push(env.DB.prepare("INSERT INTO MatchHistory (log_text, score_deltas, match_data, display_order, match_date, api_match_id) VALUES (?, ?, ?, ?, ?, ?)").bind(logText, deltasJson, matchDataJson, newDisplayOrder, finalMatchDate, apiMatchId || null));
+        statements.push(env.DB.prepare("INSERT INTO MatchHistory (log_text, score_deltas, match_data, display_order, match_date, api_match_id) VALUES (?, ?, ?, ?, ?, ?)").bind(computed.logText, computed.deltasJson, computed.matchDataJson, Date.now(), computed.finalMatchDate, computed.apiMatchId));
       }
 
-      if (statements.length > 0) {
-        await env.DB.batch(statements);
+      for (const [pName, change] of Object.entries(computed.playerUpdates)) {
+        statements.push(env.DB.prepare("UPDATE Players SET score = score + ? WHERE name = ?").bind(change, pName));
       }
+
+      if (statements.length > 0) await env.DB.batch(statements);
     };
 
     // --- API ENDPOINTS ---
@@ -222,7 +217,12 @@ const worker = {
     if (request.method === "POST" && url.pathname === "/api/recalculate") {
       try {
         await ensureTables();
-        const { logic } = await request.json();
+        
+        let logic = null;
+        try {
+            const body = await request.json();
+            logic = body.logic;
+        } catch(e) {} 
         
         if (logic) {
             await env.DB.prepare("INSERT OR REPLACE INTO Settings (key, value) VALUES ('bonus_logic', ?)").bind(logic).run();
@@ -231,77 +231,191 @@ const worker = {
         const settingRow = await env.DB.prepare("SELECT value FROM Settings WHERE key = 'bonus_logic'").first();
         const bonusLogic = settingRow ? settingRow.value : 'immediate';
 
-        const { results: history } = await env.DB.prepare("SELECT id, match_data, match_date, api_match_id FROM MatchHistory ORDER BY display_order ASC, id ASC").all();
+        const { results: history } = await env.DB.prepare("SELECT id, match_data, match_date, api_match_id, display_order FROM MatchHistory ORDER BY display_order ASC, id ASC").all();
+        const { results: allBets } = await env.DB.prepare("SELECT player_name, team_name, bet_amount FROM Bets").all();
 
-        await env.DB.prepare("DELETE FROM MatchHistory").run();
-        await env.DB.prepare("UPDATE Players SET score = 0").run();
-
-        // 🚀 CRITICAL FIX: Build team stats globally for recalculation, ignoring API group labels
         const teamStats = {};
         const teamNames = Object.keys(teamRegions);
-        teamNames.forEach(team => {
-            teamStats[team] = { pts: 0, gd: 0, gf: 0, mp: 0 };
-        });
-
-        const advancedTeams = new Set();
-        let processedBonuses = new Set();
+        teamNames.forEach(team => { teamStats[team] = { pts: 0, gd: 0, gf: 0, ga: 0, mp: 0 }; });
 
         for (const row of history) {
-            let payload = JSON.parse(row.match_data);
+            let p;
+            try { p = JSON.parse(row.match_data); } catch(e) { continue; }
+            if (p.isBonusOnly) continue; 
+            
+            let isGroup = p.stage === 'group' || p.stage === 'GROUP_STAGE';
+            if (isGroup) {
+                let gA = parseInt(p.regGoalsA ?? p.goalsA) || 0;
+                let gB = parseInt(p.regGoalsB ?? p.goalsB) || 0;
+
+                if(teamStats[p.teamA]) {
+                    teamStats[p.teamA].mp++;
+                    teamStats[p.teamA].gf += gA;
+                    teamStats[p.teamA].ga += gB;
+                    teamStats[p.teamA].gd = teamStats[p.teamA].gf - teamStats[p.teamA].ga;
+                    if (gA > gB) teamStats[p.teamA].pts += 3;
+                    else if (gA === gB) teamStats[p.teamA].pts += 1;
+                }
+                if(teamStats[p.teamB]) {
+                    teamStats[p.teamB].mp++;
+                    teamStats[p.teamB].gf += gB;
+                    teamStats[p.teamB].ga += gA;
+                    teamStats[p.teamB].gd = teamStats[p.teamB].gf - teamStats[p.teamB].ga;
+                    if (gB > gA) teamStats[p.teamB].pts += 3;
+                    else if (gA === gB) teamStats[p.teamB].pts += 1;
+                }
+            }
+        }
+
+        const advancedTeams = new Set();
+        const top2Teams = new Set();
+        const thirdPlaceTeams = [];
+
+        for (let i = 0; i < teamNames.length; i += 4) {
+            const groupTeams = teamNames.slice(i, i + 4);
+            groupTeams.sort((a, b) => {
+                const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
+                if (ptsDiff !== 0) return ptsDiff;
+                const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
+                if (gdDiff !== 0) return gdDiff;
+                return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
+            });
+            
+            if (teamStats[groupTeams[0]] && teamStats[groupTeams[0]].mp === 3) { top2Teams.add(groupTeams[0]); advancedTeams.add(groupTeams[0]); }
+            if (teamStats[groupTeams[1]] && teamStats[groupTeams[1]].mp === 3) { top2Teams.add(groupTeams[1]); advancedTeams.add(groupTeams[1]); }
+            
+            if (teamStats[groupTeams[2]] && teamStats[groupTeams[2]].mp === 3) {
+                thirdPlaceTeams.push(groupTeams[2]);
+            }
+        }
+
+        const allGroupsFinished = teamNames.every(t => teamStats[t].mp >= 3);
+        const top8Thirds = new Set();
+
+        if (allGroupsFinished) {
+            thirdPlaceTeams.sort((a, b) => {
+                const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
+                if (ptsDiff !== 0) return ptsDiff;
+                const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
+                if (gdDiff !== 0) return gdDiff;
+                return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
+            });
+            const bestThirds = thirdPlaceTeams.slice(0, 8);
+            bestThirds.forEach(t => { top8Thirds.add(t); advancedTeams.add(t); });
+        }
+
+        let runningMp = {};
+        let processedBonuses = new Set();
+        let totalPlayerScores = {};
+        let insertStatements = [];
+
+        for (const row of history) {
+            let payload;
+            try { payload = JSON.parse(row.match_data); } catch(e) { continue; }
             if (payload.isBonusOnly) continue; 
             
             let isGroup = payload.stage === 'group' || payload.stage === 'GROUP_STAGE';
-            let originalBonusA = Number(payload.bonusA) || 0;
-            let originalBonusB = Number(payload.bonusB) || 0;
-
+            
             if (isGroup) {
-                let gA = parseInt(payload.regGoalsA ?? payload.goalsA) || 0;
-                let gB = parseInt(payload.regGoalsB ?? payload.goalsB) || 0;
-
-                if(teamStats[payload.teamA]) {
-                    teamStats[payload.teamA].mp++;
-                    teamStats[payload.teamA].gf += gA;
-                    teamStats[payload.teamA].gd += (gA - gB);
-                    if (gA > gB) teamStats[payload.teamA].pts += 3;
-                    else if (gA === gB) teamStats[payload.teamA].pts += 1;
-                }
-                if(teamStats[payload.teamB]) {
-                    teamStats[payload.teamB].mp++;
-                    teamStats[payload.teamB].gf += gB;
-                    teamStats[payload.teamB].gd += (gB - gA);
-                    if (gB > gA) teamStats[payload.teamB].pts += 3;
-                    else if (gA === gB) teamStats[payload.teamB].pts += 1;
-                }
+                runningMp[payload.teamA] = (runningMp[payload.teamA] || 0) + 1;
+                runningMp[payload.teamB] = (runningMp[payload.teamB] || 0) + 1;
             }
 
             let mathEnginePayload = { ...payload };
 
             if (bonusLogic === 'separate' && isGroup) {
-                if (originalBonusA === 12) mathEnginePayload.bonusA = 0;
-                if (originalBonusB === 12) mathEnginePayload.bonusB = 0;
+                mathEnginePayload.bonusA = 0;
+                mathEnginePayload.bonusB = 0;
             }
 
-            mathEnginePayload.editId = null; 
-            await processMatch(env, mathEnginePayload, teamRegions, payload);
+            // 🚀 CLEANUP: Scrub buggy advancement bonuses out of live/paused knockout matches
+            if (!isGroup && mathEnginePayload.matchStatus !== "FINISHED") {
+                mathEnginePayload.bonusA = 0;
+                mathEnginePayload.bonusB = 0;
+            }
 
-            if (bonusLogic === 'separate') {
-                const checkBonus = async (team, origBonus) => {
-                    if (origBonus === 12 && teamStats[team] && teamStats[team].mp >= 3 && !processedBonuses.has(team)) {
+            const isMf = mathEnginePayload.stage === 'knockout_late';
+            const queryTeams = [mathEnginePayload.teamA, mathEnginePayload.teamB];
+            if (isMf) {
+              if (teamRegions[mathEnginePayload.teamA]) queryTeams.push(teamRegions[mathEnginePayload.teamA]);
+              if (teamRegions[mathEnginePayload.teamB]) queryTeams.push(teamRegions[mathEnginePayload.teamB]);
+            }
+            const filteredBets = allBets.filter(b => queryTeams.includes(b.team_name));
+
+            mathEnginePayload.editId = null; 
+            const computed = computeMatchData(mathEnginePayload, filteredBets, teamRegions, payload);
+            
+            for (const [pName, change] of Object.entries(computed.playerUpdates)) {
+                totalPlayerScores[pName] = (totalPlayerScores[pName] || 0) + change;
+            }
+            
+            insertStatements.push(env.DB.prepare("INSERT INTO MatchHistory (log_text, score_deltas, match_data, display_order, match_date, api_match_id) VALUES (?, ?, ?, ?, ?, ?)").bind(computed.logText, computed.deltasJson, computed.matchDataJson, row.display_order || Date.now(), computed.finalMatchDate, computed.apiMatchId || null));
+
+            if (bonusLogic === 'separate' && isGroup) {
+                const checkTop2Bonus = (team) => {
+                    if (top2Teams.has(team) && runningMp[team] === 3 && !processedBonuses.has(team)) {
                         let bonusPayload = {
                             teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
                             teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
-                            stage: 'group', matchDate: payload.matchDate, apiMatchId: null, isKnockout: false, isBonusOnly: true,
+                            stage: 'group', matchDate: '2026-06-28', apiMatchId: null, isKnockout: false, isBonusOnly: true,
                             matchStatus: "FINISHED", matchMinute: null, editId: null
                         };
-                        await processMatch(env, bonusPayload, teamRegions, bonusPayload);
+                        const bonusBets = allBets.filter(b => b.team_name === team);
+                        const computedBonus = computeMatchData(bonusPayload, bonusBets, teamRegions, bonusPayload);
+                        
+                        for (const [pName, change] of Object.entries(computedBonus.playerUpdates)) {
+                            totalPlayerScores[pName] = (totalPlayerScores[pName] || 0) + change;
+                        }
+
+                        insertStatements.push(env.DB.prepare("INSERT INTO MatchHistory (log_text, score_deltas, match_data, display_order, match_date, api_match_id) VALUES (?, ?, ?, ?, ?, ?)").bind(computedBonus.logText, computedBonus.deltasJson, computedBonus.matchDataJson, (row.display_order || Date.now()) + 1, computedBonus.finalMatchDate, null));
                         processedBonuses.add(team);
                     }
                 };
-                await checkBonus(payload.teamA, originalBonusA);
-                await checkBonus(payload.teamB, originalBonusB);
+                
+                checkTop2Bonus(payload.teamA);
+                checkTop2Bonus(payload.teamB);
+
+                const allGroupsNowFinished = teamNames.every(t => (runningMp[t] || 0) >= 3);
+                if (allGroupsNowFinished) {
+                    for (let team of top8Thirds) {
+                        if (!processedBonuses.has(team)) {
+                            let bonusPayload = {
+                                teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
+                                teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
+                                stage: 'group', matchDate: '2026-06-28', apiMatchId: null, isKnockout: false, isBonusOnly: true,
+                                matchStatus: "FINISHED", matchMinute: null, editId: null
+                            };
+                            const bonusBets = allBets.filter(b => b.team_name === team);
+                            const computedBonus = computeMatchData(bonusPayload, bonusBets, teamRegions, bonusPayload);
+                            
+                            for (const [pName, change] of Object.entries(computedBonus.playerUpdates)) {
+                                totalPlayerScores[pName] = (totalPlayerScores[pName] || 0) + change;
+                            }
+
+                            insertStatements.push(env.DB.prepare("INSERT INTO MatchHistory (log_text, score_deltas, match_data, display_order, match_date, api_match_id) VALUES (?, ?, ?, ?, ?, ?)").bind(computedBonus.logText, computedBonus.deltasJson, computedBonus.matchDataJson, (row.display_order || Date.now()) + 2, computedBonus.finalMatchDate, null));
+                            processedBonuses.add(team);
+                        }
+                    }
+                }
             }
         }
         
+        await env.DB.prepare("DROP TABLE IF EXISTS MatchHistory").run();
+        await ensureTables();
+        await env.DB.prepare("UPDATE Players SET score = 0").run();
+
+        for (let i = 0; i < insertStatements.length; i += 20) {
+            await env.DB.batch(insertStatements.slice(i, i + 20));
+        }
+
+        const playerStmts = [];
+        for (const [pName, total] of Object.entries(totalPlayerScores)) {
+            playerStmts.push(env.DB.prepare("UPDATE Players SET score = ? WHERE name = ?").bind(total, pName));
+        }
+        for (let i = 0; i < playerStmts.length; i += 20) {
+            await env.DB.batch(playerStmts.slice(i, i + 20));
+        }
+
         return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500 });
@@ -449,7 +563,11 @@ const worker = {
     if (request.method === "POST" && url.pathname === "/api/sync") {
       try {
         await ensureTables();
-        const { apiKey } = await request.json();
+        let apiKey = null;
+        try {
+            const body = await request.json();
+            apiKey = body.apiKey;
+        } catch(e) {}
         if (!apiKey) return new Response(JSON.stringify({ error: "Missing API Key" }), { status: 400 });
 
         const apiRes = await fetch("https://api.football-data.org/v4/competitions/WC/matches", {
@@ -486,11 +604,10 @@ const worker = {
            } catch(e){ return {}; }
         });
 
-        // 🚀 CRITICAL FIX: Track group standings completely independently of the external API's group mappings!
         const teamStats = {};
         const teamNames = Object.keys(teamRegions);
         teamNames.forEach(team => {
-            teamStats[team] = { pts: 0, gd: 0, gf: 0, mp: 0 };
+            teamStats[team] = { pts: 0, gd: 0, gf: 0, ga: 0, mp: 0 };
         });
 
         allMatches.forEach(m => {
@@ -505,7 +622,8 @@ const worker = {
                 if (teamStats[tA]) {
                     teamStats[tA].mp++;
                     teamStats[tA].gf += gA;
-                    teamStats[tA].gd += (gA - gB);
+                    teamStats[tA].ga += gB;
+                    teamStats[tA].gd = teamStats[tA].gf - teamStats[tA].ga;
                     if (gA > gB) teamStats[tA].pts += 3;
                     else if (gA === gB) teamStats[tA].pts += 1;
                 }
@@ -513,7 +631,8 @@ const worker = {
                 if (teamStats[tB]) {
                     teamStats[tB].mp++;
                     teamStats[tB].gf += gB;
-                    teamStats[tB].gd += (gB - gA);
+                    teamStats[tB].ga += gA;
+                    teamStats[tB].gd = teamStats[tB].gf - teamStats[tB].ga;
                     if (gB > gA) teamStats[tB].pts += 3;
                     else if (gA === gB) teamStats[tB].pts += 1;
                 }
@@ -521,18 +640,40 @@ const worker = {
         });
 
         const advancedTeams = new Set();
+        const top2Teams = new Set();
+        const thirdPlaceTeams = [];
         
-        // Find top 2 using identical UI Grouping logic
         for (let i = 0; i < teamNames.length; i += 4) {
             const groupTeams = teamNames.slice(i, i + 4);
             groupTeams.sort((a, b) => {
-                if (teamStats[b].pts !== teamStats[a].pts) return teamStats[b].pts - teamStats[a].pts;
-                if (teamStats[b].gd !== teamStats[a].gd) return teamStats[b].gd - teamStats[a].gd;
-                return teamStats[b].gf - teamStats[a].gf;
+                const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
+                if (ptsDiff !== 0) return ptsDiff;
+                const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
+                if (gdDiff !== 0) return gdDiff;
+                return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
             });
             
-            if (teamStats[groupTeams[0]].mp === 3) advancedTeams.add(groupTeams[0]);
-            if (teamStats[groupTeams[1]].mp === 3) advancedTeams.add(groupTeams[1]);
+            if (teamStats[groupTeams[0]] && teamStats[groupTeams[0]].mp === 3) { top2Teams.add(groupTeams[0]); advancedTeams.add(groupTeams[0]); }
+            if (teamStats[groupTeams[1]] && teamStats[groupTeams[1]].mp === 3) { top2Teams.add(groupTeams[1]); advancedTeams.add(groupTeams[1]); }
+
+            if (teamStats[groupTeams[2]]) {
+                thirdPlaceTeams.push(groupTeams[2]);
+            }
+        }
+
+        const allGroupsFinished = teamNames.every(t => teamStats[t].mp >= 3);
+        const top8Thirds = new Set();
+
+        if (allGroupsFinished) {
+            thirdPlaceTeams.sort((a, b) => {
+                const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
+                if (ptsDiff !== 0) return ptsDiff;
+                const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
+                if (gdDiff !== 0) return gdDiff;
+                return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
+            });
+            const bestThirds = thirdPlaceTeams.slice(0, 8);
+            bestThirds.forEach(t => { top8Thirds.add(t); advancedTeams.add(t); });
         }
 
         const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
@@ -561,19 +702,10 @@ const worker = {
                     clinchingMatches[lastMatch.id][team] = 12;
                 }
             } else {
-                if (teamStats[team].mp >= 3) {
-                    standaloneBonusesToProcess.push(team);
-                }
+                if (top2Teams.has(team)) standaloneBonusesToProcess.push(team);
+                if (top8Thirds.has(team)) standaloneBonusesToProcess.push(team);
             }
         });
-
-        const getTodayString = () => {
-            const d = new Date();
-            const year = d.getFullYear();
-            const month = String(d.getMonth() + 1).padStart(2, '0');
-            const day = String(d.getDate()).padStart(2, '0');
-            return year + "-" + month + "-" + day;
-        };
 
         for (const team of standaloneBonusesToProcess) {
            const existingBonus = existingMatches.find(m => m.isBonusOnly && m.teamA === team);
@@ -581,7 +713,7 @@ const worker = {
                const payload = {
                   teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
                   teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
-                  stage: 'group', matchDate: getTodayString(), apiMatchId: null, isKnockout: false, isBonusOnly: true,
+                  stage: 'group', matchDate: '2026-06-28', apiMatchId: null, isKnockout: false, isBonusOnly: true, // HARDCODED 28 JUN 2026
                   matchStatus: "FINISHED", matchMinute: null, editId: null
                };
                await processMatch(env, payload, teamRegions);
@@ -615,7 +747,6 @@ const worker = {
                regGoalsB = fullGoalsB;
            }
 
-           // 1. Calculate intended bonuses
            let calculatedBonusA = 0;
            let calculatedBonusB = 0;
 
@@ -624,30 +755,32 @@ const worker = {
                    if (clinchingMatches[apiId][teamA]) calculatedBonusA = 12;
                    if (clinchingMatches[apiId][teamB]) calculatedBonusB = 12;
                }
-           } else if (["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS"].includes(stageStr)) {
-               let overallWinner = null;
-               if (match.score?.winner === "HOME_TEAM" || match.score?.winner === "HOME") overallWinner = teamA;
-               else if (match.score?.winner === "AWAY_TEAM" || match.score?.winner === "AWAY") overallWinner = teamB;
-               else {
-                   const duration = match.score?.duration;
-                   if (duration === "PENALTY_SHOOTOUT" && match.score?.penalties) overallWinner = match.score.penalties.home > match.score.penalties.away ? teamA : teamB;
-                   else if (duration === "EXTRA_TIME" && match.score?.extraTime) overallWinner = match.score.fullTime.home > match.score.fullTime.away ? teamA : teamB;
+           } else if (match.status === "FINISHED") { // 🚀 FIX: KNOCKOUT BONUSES ONLY APPLY WHEN FINISHED
+               if (["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS"].includes(stageStr)) {
+                   let overallWinner = null;
+                   if (match.score?.winner === "HOME_TEAM" || match.score?.winner === "HOME") overallWinner = teamA;
+                   else if (match.score?.winner === "AWAY_TEAM" || match.score?.winner === "AWAY") overallWinner = teamB;
                    else {
-                       if (regGoalsA > regGoalsB) overallWinner = teamA;
-                       else if (regGoalsA < regGoalsB) overallWinner = teamB;
+                       const duration = match.score?.duration;
+                       if (duration === "PENALTY_SHOOTOUT" && match.score?.penalties) overallWinner = match.score.penalties.home > match.score.penalties.away ? teamA : teamB;
+                       else if (duration === "EXTRA_TIME" && match.score?.extraTime) overallWinner = match.score.fullTime.home > match.score.fullTime.away ? teamA : teamB;
+                       else {
+                           if (regGoalsA > regGoalsB) overallWinner = teamA;
+                           else if (regGoalsA < regGoalsB) overallWinner = teamB;
+                       }
                    }
-               }
 
-               if (overallWinner === teamA) calculatedBonusA = 12;
-               if (overallWinner === teamB) calculatedBonusB = 12;
-           } else if (stageStr === "THIRD_PLACE") {
-               let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
-               if (overallWinner === teamA) calculatedBonusA = 5;
-               if (overallWinner === teamB) calculatedBonusB = 5;
-           } else if (stageStr === "FINAL") {
-               let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
-               if (overallWinner === teamA) calculatedBonusA = 20;
+                   if (overallWinner === teamA) calculatedBonusA = 12;
+                   if (overallWinner === teamB) calculatedBonusB = 12;
+               } else if (stageStr === "THIRD_PLACE") {
+                   let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
+                   if (overallWinner === teamA) calculatedBonusA = 5;
+                   if (overallWinner === teamB) calculatedBonusB = 5;
+               } else if (stageStr === "FINAL") {
+                   let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
+                   if (overallWinner === teamA) calculatedBonusA = 20;
                if (overallWinner === teamB) calculatedBonusB = 20;
+               }
            }
 
            let editId = null;
@@ -655,9 +788,11 @@ const worker = {
            let existingManual = null;
            
            if (existingByApiId) {
-               // 🚀 CRITICAL FIX: Ensure the API doesn't skip matches that are missing a calculated bonus!
-               if (calculatedBonusA === 0 && Number(existingByApiId.bonusA) > 0) calculatedBonusA = Number(existingByApiId.bonusA);
-               if (calculatedBonusB === 0 && Number(existingByApiId.bonusB) > 0) calculatedBonusB = Number(existingByApiId.bonusB);
+               // 🚀 FIX: Prevent buggy knockout bonuses from carrying over if match isn't finished!
+               if (stage === 'group' || stageStr === "GROUP_STAGE" || match.status === "FINISHED") {
+                   if (calculatedBonusA === 0 && Number(existingByApiId.bonusA) > 0) calculatedBonusA = Number(existingByApiId.bonusA);
+                   if (calculatedBonusB === 0 && Number(existingByApiId.bonusB) > 0) calculatedBonusB = Number(existingByApiId.bonusB);
+               }
 
                let scoreChanged = (existingByApiId.fullGoalsA !== fullGoalsA || existingByApiId.fullGoalsB !== fullGoalsB || existingByApiId.regGoalsA !== regGoalsA || existingByApiId.regGoalsB !== regGoalsB);
                let bonusChanged = (Number(existingByApiId.bonusA) !== calculatedBonusA || Number(existingByApiId.bonusB) !== calculatedBonusB);
@@ -851,20 +986,6 @@ const worker = {
       <div class="container">
         <h1>🏆 World Cup 2026 DB03 Dashboard</h1>
 
-        <div style="grid-column: span 2; background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; border-left: 4px solid #8b5cf6;">
-           <div>
-              <h3 style="margin: 0 0 0.5rem 0; color: #1f2937;">⚡ Advancement Bonus Logic (+12)</h3>
-              <p style="margin: 0; font-size: 0.85rem; color: #6b7280;">Choose how to display and calculate the Group Stage advancement points.</p>
-           </div>
-           <div style="display: flex; gap: 1rem; align-items: center;">
-              <select id="frontend-logic-toggle" style="padding: 0.75rem; border-radius: 6px; border: 1px solid #d1d5db; background: #f9fafb; font-weight: bold; color: #1f2937; cursor: pointer; min-width: 250px;">
-                 <option value="immediate">Immediate (Baked into Match)</option>
-                 <option value="separate">End of Group Stage (Separate Record)</option>
-              </select>
-              <button onclick="applyLogicToggle()" style="background: #8b5cf6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; font-weight: bold; cursor: pointer; transition: background 0.2s;">Apply Changes</button>
-           </div>
-        </div>
-        
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center;">
              <h2>Leaderboard</h2>
@@ -948,6 +1069,20 @@ const worker = {
               <button class="btn-danger" id="reset-btn" onclick="resetScores()">🚨 Reset System</button>
             </div>
           </div>
+        </div>
+
+        <div style="grid-column: span 2; background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; border-left: 4px solid #8b5cf6;">
+           <div>
+              <h3 style="margin: 0 0 0.5rem 0; color: #1f2937;">⚡ Advancement Bonus Logic (+12)</h3>
+              <p style="margin: 0; font-size: 0.85rem; color: #6b7280;">Choose how to display and calculate the Group Stage advancement points.</p>
+           </div>
+           <div style="display: flex; gap: 1rem; align-items: center;">
+              <select id="frontend-logic-toggle" style="padding: 0.75rem; border-radius: 6px; border: 1px solid #d1d5db; background: #f9fafb; font-weight: bold; color: #1f2937; cursor: pointer; min-width: 250px;">
+                 <option value="immediate">Immediate (Baked into Match)</option>
+                 <option value="separate">End of Group Stage (Separate Record)</option>
+              </select>
+              <button onclick="applyLogicToggle()" style="background: #8b5cf6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; font-weight: bold; cursor: pointer; transition: background 0.2s;">Apply Changes</button>
+           </div>
         </div>
 
         <div class="card" style="grid-column: span 2;">
@@ -1143,7 +1278,13 @@ const worker = {
           }).catch(console.error);
         }
 
+        // 🚀 BRACKET ENGINE: Flawlessly matches the provided 16-match sequence and cascades names perfectly
         function renderBracket(stats, groupsMap) {
+            const teamGroups = {};
+            for (let [grp, tms] of Object.entries(groupsMap)) {
+                tms.forEach(t => teamGroups[t] = grp);
+            }
+
             const resolveTeam = (code) => {
                 if (code.length === 2 && code.match(/^[1-2][A-L]$/)) {
                     const rank = parseInt(code[0]) - 1;
@@ -1152,97 +1293,194 @@ const worker = {
                         const teamName = groupsMap[grp][rank];
                         if (stats[teamName] && stats[teamName].mp > 0) return teamName;
                     }
+                } else if (code.startsWith('3_')) {
+                    return wildcards[code] || "Wildcard"; 
                 }
                 return code;
             };
 
-            const r32 = [
-                { h: "1E", a: "3ABCDF", date: "30 JUN" },
-                { h: "1I", a: "3CDFGH", date: "01 JUL" },
-                { h: "2A", a: "2B", date: "29 JUN" },
-                { h: "1F", a: "2C", date: "30 JUN" },
-                { h: "2K", a: "2L", date: "03 JUL" },
-                { h: "1H", a: "2J", date: "03 JUL" },
-                { h: "1G", a: "3AEHIJ", date: "02 JUL" },
-                { h: "1C", a: "2F", date: "30 JUN" },
-                { h: "2E", a: "2I", date: "01 JUL" },
-                { h: "1A", a: "3CEFHI", date: "01 JUL" },
-                { h: "1L", a: "3ABCGHK", date: "02 JUL" },
-                { h: "1D", a: "3FGHIJK", date: "29 JUN" },
-                { h: "2G", a: "2K", date: "02 JUL" },
-                { h: "1B", a: "3EFGHIJ", date: "29 JUN" },
-                { h: "1J", a: "3EFGHIJ", date: "04 JUL" },
-                { h: "1K", a: "3DEIJKL", date: "04 JUL" }
+            const r32Matches = [
+                { id: "M73", h: "2A", a: "2B", date: "29 JUN" },
+                { id: "M75", h: "1F", a: "2C", date: "30 JUN" },
+                { id: "M74", h: "1E", a: "3_1", date: "29 JUN" },
+                { id: "M77", h: "1I", a: "3_2", date: "01 JUL" },
+                { id: "M83", h: "2K", a: "2L", date: "02 JUL" },
+                { id: "M84", h: "1H", a: "2J", date: "03 JUL" },
+                { id: "M81", h: "1D", a: "3_5", date: "01 JUL" },
+                { id: "M82", h: "1G", a: "3_6", date: "02 JUL" },
+                { id: "M76", h: "1C", a: "2F", date: "30 JUN" },
+                { id: "M78", h: "2E", a: "2I", date: "01 JUL" },
+                { id: "M79", h: "1A", a: "3_3", date: "30 JUN" },
+                { id: "M80", h: "1L", a: "3_4", date: "02 JUL" },
+                { id: "M86", h: "1J", a: "2H", date: "04 JUL" },
+                { id: "M88", h: "2D", a: "2G", date: "04 JUL" },
+                { id: "M85", h: "1B", a: "3_7", date: "03 JUL" },
+                { id: "M87", h: "1K", a: "3_8", date: "04 JUL" }
             ];
 
-            let html = '<div class="bracket-column">';
-            r32.forEach(m => {
-                let home = resolveTeam(m.h);
-                let away = resolveTeam(m.a);
-                let hClass = home === m.h ? '' : 'confirmed';
-                let aClass = away === m.a ? '' : 'confirmed';
+            const thirdPlaceTeams = [];
+            for (let [grp, tms] of Object.entries(groupsMap)) {
+                if (tms[2] && stats[tms[2]] && stats[tms[2]].mp > 0) {
+                    thirdPlaceTeams.push(tms[2]);
+                }
+            }
+            
+            let bestThirds = [];
+            if (thirdPlaceTeams.length > 0) {
+                thirdPlaceTeams.sort((a, b) => {
+                    const ptsDiff = (stats[b].pts || 0) - (stats[a].pts || 0);
+                    if (ptsDiff !== 0) return ptsDiff;
+                    const gdDiff = (stats[b].gd || 0) - (stats[a].gd || 0);
+                    if (gdDiff !== 0) return gdDiff;
+                    return (stats[b].gf || 0) - (stats[a].gf || 0);
+                });
+                bestThirds = thirdPlaceTeams.slice(0, 8);
+            }
 
-                let matchScoreH = "";
-                let matchScoreA = "";
+            const wildcards = {};
+            let thirdSlots = r32Matches.filter(m => m.a.startsWith('3_'));
+            
+            let assignment = {};
+            function solve(index, available) {
+                if (index === thirdSlots.length || available.length === 0) return true;
+                let slot = thirdSlots[index];
+                let hostTeam = resolveTeam(slot.h);
+                let hostGroup = teamGroups[hostTeam] || slot.h.charAt(1);
                 
+                for (let i = 0; i < available.length; i++) {
+                    let t = available[i];
+                    let tGroup = teamGroups[t];
+                    if (tGroup !== hostGroup) { 
+                        assignment[slot.a] = t;
+                        let rem = [...available];
+                        rem.splice(i, 1);
+                        if (solve(index + 1, rem)) return true;
+                        delete assignment[slot.a];
+                    }
+                }
+                
+                if (!assignment[slot.a]) {
+                    assignment[slot.a] = available[0];
+                    let rem = [...available];
+                    rem.splice(0, 1);
+                    return solve(index + 1, rem);
+                }
+                return false;
+            }
+            
+            if (bestThirds.length > 0) {
+                solve(0, bestThirds);
+                Object.assign(wildcards, assignment);
+            }
+
+            const getWinner = (tA, tB) => {
+                if (!tA || !tB || tA === 'TBD' || tB === 'TBD' || tA.startsWith('Wildcard') || tB.startsWith('Wildcard')) return null;
+                if (tA.match(/^[1-2][A-L]$/) || tB.match(/^[1-2][A-L]$/)) return null;
+
                 const loggedMatch = historyData.find(log => {
                     try {
                         const p = JSON.parse(log.match_data || "{}");
                         if (!p.teamA || p.isBonusOnly) return false;
                         const isKoMatch = p.isKnockout || (p.stage && p.stage.startsWith('knockout'));
                         if (!isKoMatch) return false;
-                        return (p.teamA === home && p.teamB === away) || (p.teamA === away && p.teamB === home);
+                        return (p.teamA.trim() === tA.trim() && p.teamB.trim() === tB.trim()) || 
+                               (p.teamA.trim() === tB.trim() && p.teamB.trim() === tA.trim());
                     } catch(e) { return false; }
                 });
-
+                
                 if (loggedMatch) {
                     const p = JSON.parse(loggedMatch.match_data);
-                    if (p.teamA === home) {
-                        matchScoreH = p.fullGoalsA !== undefined ? p.fullGoalsA : "";
-                        matchScoreA = p.fullGoalsB !== undefined ? p.fullGoalsB : "";
-                    } else {
-                        matchScoreH = p.fullGoalsB !== undefined ? p.fullGoalsB : "";
-                        matchScoreA = p.fullGoalsA !== undefined ? p.fullGoalsA : "";
-                    }
+                    let gA = parseInt(p.fullGoalsA) || 0;
+                    let gB = parseInt(p.fullGoalsB) || 0;
+                    if (Number(p.bonusA) > Number(p.bonusB)) return p.teamA;
+                    if (Number(p.bonusB) > Number(p.bonusA)) return p.teamB;
+                    if (gA > gB) return p.teamA;
+                    if (gB > gA) return p.teamB;
                 }
-
-                html += '<div class="bracket-match">' +
-                    '<div class="bracket-date">' + m.date + '</div>' +
-                    '<div class="bracket-team ' + hClass + '">' +
-                        '<span style="display:flex; align-items:center; gap:6px;">' +
-                            '<div class="bracket-shield"></div> ' + home +
-                        '</span>' +
-                        '<span style="font-weight:bold; font-size:0.95rem;">' + matchScoreH + '</span>' +
-                    '</div>' +
-                    '<div class="bracket-team ' + aClass + '">' +
-                        '<span style="display:flex; align-items:center; gap:6px;">' +
-                            '<div class="bracket-shield"></div> ' + away +
-                        '</span>' +
-                        '<span style="font-weight:bold; font-size:0.95rem;">' + matchScoreA + '</span>' +
-                    '</div>' +
-                '</div>';
-            });
-            html += '</div>';
-            
-            const drawEmptyCols = (count, title) => {
-                let col = '<div class="bracket-column">';
-                for(let i=0; i<count; i++) {
-                    col += '<div class="bracket-match" style="opacity: 0.6;">' +
-                        '<div class="bracket-date">' + title + '</div>' +
-                        '<div class="bracket-team"><span style="display:flex; align-items:center; gap:6px;"><div class="bracket-shield"></div> TBD</span></div>' +
-                        '<div class="bracket-team"><span style="display:flex; align-items:center; gap:6px;"><div class="bracket-shield"></div> TBD</span></div>' +
-                    '</div>';
-                }
-                col += '</div>';
-                return col;
+                return null;
             };
 
-            html += drawEmptyCols(8, 'Round of 16');
-            html += drawEmptyCols(4, 'Quarter-Finals');
-            html += drawEmptyCols(2, 'Semi-Finals');
-            html += drawEmptyCols(1, 'Final');
+            const getScore = (tA, tB, target) => {
+                if (!tA || !tB || tA === 'TBD' || tB === 'TBD') return "";
+                const loggedMatch = historyData.find(log => {
+                    try {
+                        const p = JSON.parse(log.match_data || "{}");
+                        if (!p.teamA || p.isBonusOnly) return false;
+                        const isKoMatch = p.isKnockout || (p.stage && p.stage.startsWith('knockout'));
+                        if (!isKoMatch) return false;
+                        return (p.teamA.trim() === tA.trim() && p.teamB.trim() === tB.trim()) || 
+                               (p.teamA.trim() === tB.trim() && p.teamB.trim() === tA.trim());
+                    } catch(e) { return false; }
+                });
+                if (loggedMatch) {
+                    const p = JSON.parse(loggedMatch.match_data);
+                    if (p.teamA.trim() === target.trim()) return p.fullGoalsA !== undefined ? p.fullGoalsA : "";
+                    if (p.teamB.trim() === target.trim()) return p.fullGoalsB !== undefined ? p.fullGoalsB : "";
+                }
+                return "";
+            };
 
-            document.getElementById('bracket-container').innerHTML = html;
+            const matchNodes = {};
+            r32Matches.forEach(m => {
+                let home = resolveTeam(m.h);
+                let away = resolveTeam(m.a);
+                matchNodes[m.id] = { home, away, date: m.date, winner: getWinner(home, away) };
+            });
+
+            const buildRound = (roundName, prevRoundIds, dates) => {
+                const roundNodes = {};
+                for (let i = 0; i < prevRoundIds.length; i += 2) {
+                    const m1 = matchNodes[prevRoundIds[i]];
+                    const m2 = matchNodes[prevRoundIds[i+1]];
+                    const home = m1 && m1.winner ? m1.winner : "TBD";
+                    const away = m2 && m2.winner ? m2.winner : "TBD";
+                    const id = roundName + "_" + (i/2 + 1);
+                    roundNodes[id] = { home, away, date: dates[i/2], winner: getWinner(home, away) };
+                    matchNodes[id] = roundNodes[id];
+                }
+                return roundNodes;
+            };
+
+            const r16Ids = Object.keys(buildRound('R16', r32Matches.map(m=>m.id), ["04 JUL","05 JUL","04 JUL","05 JUL","06 JUL","07 JUL","06 JUL","07 JUL"]));
+            const qfIds = Object.keys(buildRound('QF', r16Ids, ["09 JUL","10 JUL","10 JUL","11 JUL"]));
+            const sfIds = Object.keys(buildRound('SF', qfIds, ["14 JUL","15 JUL"]));
+            buildRound('FINAL', sfIds, ["19 JUL"]);
+
+            const renderCol = (nodes) => {
+                let html = '<div class="bracket-column">';
+                Object.values(nodes).forEach(n => {
+                    let hClass = n.winner && n.winner === n.home ? 'confirmed' : (n.home !== 'TBD' && !n.home.startsWith('Wildcard') ? '' : '');
+                    let aClass = n.winner && n.winner === n.away ? 'confirmed' : (n.away !== 'TBD' && !n.away.startsWith('Wildcard') ? '' : '');
+                    
+                    let sH = getScore(n.home, n.away, n.home);
+                    let sA = getScore(n.home, n.away, n.away);
+
+                    let hDisplay = n.home.startsWith("1") || n.home.startsWith("2") ? "Group " + n.home : n.home;
+                    let aDisplay = n.away.startsWith("1") || n.away.startsWith("2") ? "Group " + n.away : n.away;
+
+                    html += '<div class="bracket-match">' +
+                        '<div class="bracket-date">' + n.date + '</div>' +
+                        '<div class="bracket-team ' + hClass + '">' +
+                            '<span style="display:flex; align-items:center; gap:6px;"><div class="bracket-shield"></div> ' + hDisplay + '</span>' +
+                            '<span style="font-weight:bold; font-size:0.95rem;">' + sH + '</span>' +
+                        '</div>' +
+                        '<div class="bracket-team ' + aClass + '">' +
+                            '<span style="display:flex; align-items:center; gap:6px;"><div class="bracket-shield"></div> ' + aDisplay + '</span>' +
+                            '<span style="font-weight:bold; font-size:0.95rem;">' + sA + '</span>' +
+                        '</div>' +
+                    '</div>';
+                });
+                html += '</div>';
+                return html;
+            };
+
+            let bracketHtml = renderCol(Object.fromEntries(Object.entries(matchNodes).filter(([k]) => k.startsWith('M7') || k.startsWith('M8'))));
+            bracketHtml += renderCol(Object.fromEntries(Object.entries(matchNodes).filter(([k]) => k.startsWith('R16'))));
+            bracketHtml += renderCol(Object.fromEntries(Object.entries(matchNodes).filter(([k]) => k.startsWith('QF'))));
+            bracketHtml += renderCol(Object.fromEntries(Object.entries(matchNodes).filter(([k]) => k.startsWith('SF'))));
+            bracketHtml += renderCol(Object.fromEntries(Object.entries(matchNodes).filter(([k]) => k.startsWith('FINAL'))));
+
+            document.getElementById('bracket-container').innerHTML = bracketHtml;
         }
 
         function updateGroupStageTable() {
@@ -1282,6 +1520,8 @@ const worker = {
                         stats[p.teamB].gf += gB;
                         stats[p.teamA].ga += gB;
                         stats[p.teamB].ga += gA;
+                        stats[p.teamA].gd += (gA - gB);
+                        stats[p.teamB].gd += (gB - gA);
 
                         if (gA > gB) { stats[p.teamA].w++; stats[p.teamA].pts += 3; stats[p.teamB].l++; }
                         else if (gB > gA) { stats[p.teamB].w++; stats[p.teamB].pts += 3; stats[p.teamA].l++; }
@@ -1303,9 +1543,11 @@ const worker = {
                 const groupLetter = alphabet[i / 4];
                 
                 groupTeams.sort((a, b) => {
-                    if (stats[b].pts !== stats[a].pts) return stats[b].pts - stats[a].pts;
-                    if (stats[b].gd !== stats[a].gd) return stats[b].gd - stats[a].gd;
-                    return stats[b].gf - stats[a].gf;
+                    const ptsDiff = (stats[b].pts || 0) - (stats[a].pts || 0);
+                    if (ptsDiff !== 0) return ptsDiff;
+                    const gdDiff = (stats[b].gd || 0) - (stats[a].gd || 0);
+                    if (gdDiff !== 0) return gdDiff;
+                    return (stats[b].gf || 0) - (stats[a].gf || 0);
                 });
 
                 groups[groupLetter] = groupTeams;
@@ -1332,14 +1574,14 @@ const worker = {
                       '<tbody>';
 
                 groupTeams.forEach((team, index) => {
-                    const isTopTwo = index < 2;
-                    const rowBg = isTopTwo ? '#f0fdf4' : 'white';
-                    const rowBorder = isTopTwo ? 'border-left: 4px solid #10b981;' : 'border-left: 4px solid transparent;';
-                    const rankStyle = isTopTwo ? 'color: #10b981;' : 'color: #6b7280;';
+                    const isAdvanced = advancedTeams.has(team);
+                    const rowBg = isAdvanced ? '#f0fdf4' : 'white';
+                    const rowBorder = isAdvanced ? 'border-left: 4px solid #10b981;' : 'border-left: 4px solid transparent;';
+                    const rankStyle = isAdvanced ? 'color: #10b981;' : 'color: #6b7280;';
 
-                    const gd = stats[team].gf - stats[team].ga;
+                    const gd = stats[team].gd;
                     const sign = gd > 0 ? '+' : '';
-                    const statusHtml = stats[team].advanced ? '<span style="background:#10b981; color:white; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:bold;">✅ Advanced (+12)</span>' : '';
+                    const statusHtml = isAdvanced ? '<span style="background:#10b981; color:white; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:bold;">✅ Advanced (+12)</span>' : '';
 
                     tableHtml += '<tr style="background: ' + rowBg + '; ' + rowBorder + '">' +
                         '<td class="col-rank" style="' + rankStyle + '">' + (index + 1) + '</td>' +
@@ -1456,12 +1698,19 @@ const worker = {
                 btn.innerText = "⏳ Fixing...";
                 btn.disabled = true;
                 
-                fetch('/api/recalculate', { method: 'POST' })
+                const logic = document.getElementById('frontend-logic-toggle').value;
+
+                fetch('/api/recalculate', { 
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ logic: logic }) 
+                })
                 .then(res => res.json())
                 .then(data => {
                     if(data.success) {
                         alert("✅ Leaderboard successfully recalculated! The math is now perfect.");
                         loadLeaderboard();
+                        loadHistory();
                     } else alert("Error: " + data.error);
                 }).catch(console.error)
                 .finally(() => {
@@ -1612,34 +1861,41 @@ const worker = {
                       let notesArr = [];
 
                       const buildReceiptRow = (teamName, weight, pureBondPts, flatBonusPts, callPts, isKoMode, isMfBet, isBonusOnly) => {
-                          let totalBond = pureBondPts + flatBonusPts;
+                          let bondMult = (weight === -1 || weight === 0.5 || weight === 1) ? weight : ((weight === 2 || weight === 3) ? (isKoMode ? 2 : 1) : 0);
+                          let bonusMult = (weight === -1 || weight === 0.5 || weight === 1) ? weight : ((weight === 2 || weight === 3) ? (isKoMode ? 2 : 1) : 0);
+
                           let finalPts = 0;
                           let explanation = "";
-                          
-                          let bondMult = (weight === -1 || weight === 0.5 || weight === 1) ? weight : ((weight === 2 || weight === 3) ? (isKoMode ? 2 : 1) : 0);
-                          
-                          let bondStr = flatBonusPts > 0 ? "(" + pureBondPts + " Bond + " + flatBonusPts + " Bonus)" : pureBondPts + " Bond";
-                          if (isBonusOnly) bondStr = flatBonusPts + " Bonus";
 
                           if (isMfBet) {
-                              finalPts = totalBond * weight;
-                              explanation = weight + " × " + totalBond + " Fund Base " + (flatBonusPts > 0 ? "[" + pureBondPts + " + " + flatBonusPts + "]" : "");
+                              finalPts = (pureBondPts + flatBonusPts) * weight;
+                              explanation = weight + " × " + (pureBondPts + flatBonusPts) + " Fund Base " + (flatBonusPts > 0 ? "[" + pureBondPts + " + " + flatBonusPts + "]" : "");
                           } else if (isBonusOnly) {
-                              finalPts = flatBonusPts * bondMult;
-                              explanation = flatBonusPts + " Bonus × " + bondMult + (isKoMode && bondMult === 2 ? " KO" : "");
+                              finalPts = flatBonusPts * bonusMult;
+                              explanation = flatBonusPts + " Bonus × " + bonusMult;
                           } else {
                               if (weight === -1 || weight === 0.5 || weight === 1) {
-                                  finalPts = totalBond * weight;
+                                  finalPts = (pureBondPts + flatBonusPts) * weight;
+                                  let bondStr = flatBonusPts > 0 ? "(" + pureBondPts + " Bond + " + flatBonusPts + " Bonus)" : pureBondPts + " Bond";
                                   explanation = weight + " × " + bondStr;
-                              } else if (weight === 2) {
-                                  finalPts = totalBond * bondMult;
-                                  let koStr = isKoMode ? " KO" : "";
-                                  explanation = bondStr + " × " + bondMult + koStr;
-                              } else if (weight === 3) {
-                                  finalPts = (totalBond * bondMult) + callPts;
-                                  let koStr = isKoMode ? " KO" : "";
-                                  let callStr = callPts > 0 ? " + " + callPts + " Call" : "";
-                                  explanation = bondStr + " × " + bondMult + koStr + callStr;
+                              } else if (weight === 2 || weight === 3) {
+                                  if (bondMult === bonusMult) {
+                                      let totalBond = pureBondPts + flatBonusPts;
+                                      finalPts = totalBond * bondMult;
+                                      let bondStr = flatBonusPts > 0 ? "(" + pureBondPts + " Bond + " + flatBonusPts + " Bonus)" : pureBondPts + " Bond";
+                                      explanation = bondStr + " × " + bondMult + (isKoMode ? " KO" : "");
+                                  } else {
+                                      finalPts = (pureBondPts * bondMult) + (flatBonusPts * bonusMult);
+                                      explanation = pureBondPts + " Bond × " + bondMult;
+                                      if (flatBonusPts > 0) {
+                                          explanation += " + " + flatBonusPts + " Bonus × " + bonusMult;
+                                      }
+                                  }
+                                  
+                                  if (weight === 3 && callPts > 0) {
+                                      finalPts += callPts;
+                                      explanation += " + " + callPts + " Call";
+                                  }
                               }
                           }
 
