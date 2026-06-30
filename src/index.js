@@ -36,7 +36,6 @@ const worker = {
       try { await env.DB.prepare("ALTER TABLE MatchHistory ADD COLUMN api_match_id INTEGER").run(); } catch (e) {}
     };
 
-    // --- CORE MATH ENGINE ---
     const computeMatchData = (payload, bets, teamRegions, originalPayloadForDb = null) => {
       let { teamA, regGoalsA, fullGoalsA, bonusA, teamB, regGoalsB, fullGoalsB, bonusB, stage, matchDate, apiMatchId, isBonusOnly, matchStatus, matchMinute } = payload;
       const isKnockout = stage ? stage.startsWith('knockout') : payload.isKnockout;
@@ -51,9 +50,11 @@ const worker = {
       let resultA = 0, resultB = 0, goalPointsA = 0, goalPointsB = 0;
 
       if (!isBonusOnly) {
+          // 🚀 RULE 1: Win/Draw/Loss strictly bounded to 90m (regGoals)
           resultA = regGoalsA > regGoalsB ? 32 : (regGoalsA === regGoalsB ? 12 : -10);
           resultB = regGoalsB > regGoalsA ? 32 : (regGoalsB === regGoalsA ? 12 : -10);
 
+          // 🚀 RULE 2: Goal Points bound to 120m (fullGoals, stripped of penalties by the Sync engine)
           goalPointsA = (fullGoalsA * 8) + (fullGoalsB * -4);
           goalPointsB = (fullGoalsB * 8) + (fullGoalsA * -4);
 
@@ -315,7 +316,9 @@ const worker = {
             if (payload.isBonusOnly) continue; 
             
             let isGroup = payload.stage === 'group' || payload.stage === 'GROUP_STAGE';
-            
+            let originalBonusA = Number(payload.bonusA) || 0;
+            let originalBonusB = Number(payload.bonusB) || 0;
+
             if (isGroup) {
                 runningMp[payload.teamA] = (runningMp[payload.teamA] || 0) + 1;
                 runningMp[payload.teamB] = (runningMp[payload.teamB] || 0) + 1;
@@ -324,14 +327,8 @@ const worker = {
             let mathEnginePayload = { ...payload };
 
             if (bonusLogic === 'separate' && isGroup) {
-                mathEnginePayload.bonusA = 0;
-                mathEnginePayload.bonusB = 0;
-            }
-
-            // 🚀 CLEANUP: Scrub buggy advancement bonuses out of live/paused knockout matches
-            if (!isGroup && mathEnginePayload.matchStatus !== "FINISHED") {
-                mathEnginePayload.bonusA = 0;
-                mathEnginePayload.bonusB = 0;
+                if (originalBonusA === 12) mathEnginePayload.bonusA = 0;
+                if (originalBonusB === 12) mathEnginePayload.bonusB = 0;
             }
 
             const isMf = mathEnginePayload.stage === 'knockout_late';
@@ -661,20 +658,22 @@ const worker = {
             }
         }
 
-        const allGroupsFinished = teamNames.every(t => teamStats[t].mp >= 3);
-        const top8Thirds = new Set();
+        thirdPlaceTeams.sort((a, b) => {
+            const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
+            if (ptsDiff !== 0) return ptsDiff;
+            const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
+            if (gdDiff !== 0) return gdDiff;
+            return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
+        });
 
-        if (allGroupsFinished) {
-            thirdPlaceTeams.sort((a, b) => {
-                const ptsDiff = (teamStats[b].pts || 0) - (teamStats[a].pts || 0);
-                if (ptsDiff !== 0) return ptsDiff;
-                const gdDiff = (teamStats[b].gd || 0) - (teamStats[a].gd || 0);
-                if (gdDiff !== 0) return gdDiff;
-                return (teamStats[b].gf || 0) - (teamStats[a].gf || 0);
-            });
-            const bestThirds = thirdPlaceTeams.slice(0, 8);
-            bestThirds.forEach(t => { top8Thirds.add(t); advancedTeams.add(t); });
-        }
+        const top8Thirds = new Set();
+        const bestThirds = thirdPlaceTeams.slice(0, 8);
+        bestThirds.forEach(t => { 
+            if (teamStats[t] && teamStats[t].mp === 3) {
+                top8Thirds.add(t); 
+                advancedTeams.add(t); 
+            }
+        });
 
         const knockoutStages = ["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"];
         allMatches.forEach(m => {
@@ -713,7 +712,7 @@ const worker = {
                const payload = {
                   teamA: team, regGoalsA: 0, fullGoalsA: 0, bonusA: 12,
                   teamB: "TBD", regGoalsB: 0, fullGoalsB: 0, bonusB: 0,
-                  stage: 'group', matchDate: '2026-06-28', apiMatchId: null, isKnockout: false, isBonusOnly: true, // HARDCODED 28 JUN 2026
+                  stage: 'group', matchDate: '2026-06-28', apiMatchId: null, isKnockout: false, isBonusOnly: true,
                   matchStatus: "FINISHED", matchMinute: null, editId: null
                };
                await processMatch(env, payload, teamRegions);
@@ -737,8 +736,22 @@ const worker = {
            if (["LAST_32", "LAST_16"].includes(stageStr)) stage = "knockout_early";
            if (["QUARTER_FINALS", "SEMI_FINALS", "THIRD_PLACE", "FINAL"].includes(stageStr)) stage = "knockout_late";
 
+           // 🚀 PENALTY STRIPPING PROTOCOL
            let fullGoalsA = match.score?.fullTime?.home ?? 0;
            let fullGoalsB = match.score?.fullTime?.away ?? 0;
+           
+           if (match.score?.penalties) {
+               let pHome = match.score.penalties.home ?? 0;
+               let pAway = match.score.penalties.away ?? 0;
+               let rHome = match.score.regularTime?.home ?? 0;
+               let rAway = match.score.regularTime?.away ?? 0;
+               
+               if (fullGoalsA >= pHome + rHome && fullGoalsB >= pAway + rAway && (pHome > 0 || pAway > 0)) {
+                   fullGoalsA -= pHome;
+                   fullGoalsB -= pAway;
+               }
+           }
+
            let regGoalsA = match.score?.regularTime?.home ?? fullGoalsA;
            let regGoalsB = match.score?.regularTime?.away ?? fullGoalsB;
 
@@ -755,7 +768,7 @@ const worker = {
                    if (clinchingMatches[apiId][teamA]) calculatedBonusA = 12;
                    if (clinchingMatches[apiId][teamB]) calculatedBonusB = 12;
                }
-           } else if (match.status === "FINISHED") { // 🚀 FIX: KNOCKOUT BONUSES ONLY APPLY WHEN FINISHED
+           } else if (match.status === "FINISHED") {
                if (["LAST_32", "LAST_16", "QUARTER_FINALS", "SEMI_FINALS"].includes(stageStr)) {
                    let overallWinner = null;
                    if (match.score?.winner === "HOME_TEAM" || match.score?.winner === "HOME") overallWinner = teamA;
@@ -779,7 +792,7 @@ const worker = {
                } else if (stageStr === "FINAL") {
                    let overallWinner = (regGoalsA > regGoalsB) ? teamA : teamB;
                    if (overallWinner === teamA) calculatedBonusA = 20;
-               if (overallWinner === teamB) calculatedBonusB = 20;
+                   if (overallWinner === teamB) calculatedBonusB = 20;
                }
            }
 
@@ -788,7 +801,6 @@ const worker = {
            let existingManual = null;
            
            if (existingByApiId) {
-               // 🚀 FIX: Prevent buggy knockout bonuses from carrying over if match isn't finished!
                if (stage === 'group' || stageStr === "GROUP_STAGE" || match.status === "FINISHED") {
                    if (calculatedBonusA === 0 && Number(existingByApiId.bonusA) > 0) calculatedBonusA = Number(existingByApiId.bonusA);
                    if (calculatedBonusB === 0 && Number(existingByApiId.bonusB) > 0) calculatedBonusB = Number(existingByApiId.bonusB);
@@ -1051,14 +1063,14 @@ const worker = {
             <div class="team-row">
               <div class="form-group"><label>Home Team</label><select id="team-a-select" class="team-dropdown"><option value="">Loading...</option></select></div>
               <div class="form-group"><label>Goals (90m)</label><input type="number" id="reg-goals-a" value="0" min="0"></div>
-              <div class="form-group"><label>Goals (120m)</label><input type="number" id="full-goals-a" value="0" min="0"></div>
+              <div class="form-group"><label>Goals (120m NO PENS)</label><input type="number" id="full-goals-a" value="0" min="0"></div>
               <div class="form-group"><label>Bonus</label><select id="bonus-a"><option value="0">None</option><option value="12">Advance (+12)</option><option value="5">3rd Place (+5)</option><option value="20">Championship (+20)</option></select></div>
             </div>
             <div class="vs-badge">VS</div>
             <div class="team-row away">
               <div class="form-group"><label>Away Team</label><select id="team-b-select" class="team-dropdown"><option value="">Loading...</option></select></div>
               <div class="form-group"><label>Goals (90m)</label><input type="number" id="reg-goals-b" value="0" min="0"></div>
-              <div class="form-group"><label>Goals (120m)</label><input type="number" id="full-goals-b" value="0" min="0"></div>
+              <div class="form-group"><label>Goals (120m NO PENS)</label><input type="number" id="full-goals-b" value="0" min="0"></div>
               <div class="form-group"><label>Bonus</label><select id="bonus-b"><option value="0">None</option><option value="12">Advance (+12)</option><option value="5">3rd Place (+5)</option><option value="20">Championship (+20)</option></select></div>
             </div>
 
@@ -1278,7 +1290,6 @@ const worker = {
           }).catch(console.error);
         }
 
-        // 🚀 BRACKET ENGINE: Flawlessly matches the provided 16-match sequence and cascades names perfectly
         function renderBracket(stats, groupsMap) {
             const teamGroups = {};
             for (let [grp, tms] of Object.entries(groupsMap)) {
